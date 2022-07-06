@@ -1,0 +1,2840 @@
+---
+title: "Data integration investigation"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+header-includes:
+  - \usepackage{setspace}\doublespacing
+  - \usepackage{mdframed, caption}
+  - \usepackage[linesnumbered,lined,boxed,commentsnumbered]{algorithm2e}
+  - \usepackage{float}
+  - \floatplacement{figure}{H} 
+  - \usepackage{longtable}
+  - \usepackage{blkarray, bigstrut}
+  - \usepackage{booktabs}
+  - \usepackage{multirow}
+bibliography: bibliography.bib
+csl: biometrics_notes.csl
+---
+
+```{r, eval = F}
+library(nimble)
+
+X <- cbind(
+  rep(1, 100),
+  rnorm(100)
+)
+y <- c(X %*% matrix(c(2, 1), ncol = 1) + rnorm(100))
+
+# function to fit model
+fit_model <- function(seed = 1, code, data, constants, inits, niter, nchains, thin = 1, nburnin = 0){
+  library(nimble)
+  
+  # some functions
+  # R model
+  model <- nimbleModel(code, constants, data)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  model_conf <- configureMCMC(model)
+  
+  # R mcmc
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc, project = model_c)
+  
+  # run model
+  out <- runMCMC(
+    mcmc_c, 
+    niter = niter, 
+    nchains = nchains, 
+    thin = thin, 
+    init = inits,
+    setSeed = seed,
+    nburnin = nburnin
+  )
+  
+  # out
+  return(out)
+}
+
+code <- nimbleCode({
+  for(i in 1:2){
+    beta[i] ~ dnorm(0, sd = 100)
+  }
+  sigma ~ T(dnorm(0, var = 100), 0, Inf)
+  
+  for(i in 1:n){
+    mu[i] <- (beta[1:2] %*% X[i, 1:2])[1,1]
+    y[i] ~ dnorm(mu[i], sd = sigma)
+  }
+})
+
+init_func <- function(){
+  out <- list(
+    beta = rnorm(2),
+    sigma = rgamma(1, 1, 1)
+  )
+  
+  return(out)
+}
+
+fit <- fit_model(
+  seed = 1:3,
+  code = code,
+  data = list(
+    # response
+    y = y
+  ),
+  constants = list(
+    n = 100,
+    X = X
+  ),
+  niter = 5000,
+  nchains = 3,
+  thin = 1,
+  nburnin = 0,
+  inits = init_func
+)
+```
+
+\newpage 
+
+```{r setup, include = F}
+rm(list = ls())
+
+library(knitr)
+hook_chunk <- knitr::knit_hooks$get('chunk')
+knit_hooks$set(chunk = function(x, options) {
+
+  # add latex commands if chunk option singlespacing is TRUE
+  if(isTRUE(options$singlespacing)){
+    return(sprintf("\\singlespacing\n %s \n\\doublespacing", hook_chunk(x, options)))
+  } else{
+    return(hook_chunk(x, options))
+  }
+})
+knitr::opts_chunk$set(
+  fig.align = "center",
+  tidy = T,
+  singlespacing = TRUE,
+  cache = FALSE,
+  fig.dim = c(10,8),
+  message = FALSE,
+  warning = FALSE,
+  comment = NA,
+  echo = F
+)
+
+
+# packages
+packs <- c("dplyr", "nimble", "htmltools", "ggplot2", "sf", "Rcpp", "RcppArmadillo", "inline", "mvtnorm", "readr", "parallel", "xtable", "rstan", "coda", "vegan", "tidyr", "gganimate", "stringr", "scatterplot3d", "plot3D", "plotly", "tidyverse", "ggalluvial", "lubridate", "ggnewscale")
+sapply(packs, require, character.only = T)
+rm(packs)
+options(tidyverse.quiet = TRUE)
+
+# convenience
+`%notin%` <- Negate("%in%")
+
+# stan settings
+options(mc.cores = parallel::detectCores() - 1)
+rstan_options(auto_write = TRUE)
+```
+
+# Introduction
+
+# Univariate normal
+
+Sampling model:
+
+\[
+y_i \sim N(\mu, \sigma^2)
+\]
+
+Priors:
+
+\[
+\begin{split}
+\mu &\sim N(\mu_0, \tau_0^2) \\
+\sigma &\sim IG(a_0, b_0)
+\end{split}
+\]
+
+## Simulated data
+
+```{r}
+sim_norm <- function(n, mu, sigma, seed = NULL){
+  if(!is.null(seed)) set.seed(seed)
+  y <- rnorm(n, mu, sigma)
+  return(y)
+}
+y <- sim_norm(500, 0, 2, seed = 05172022)
+ggplot() + 
+  geom_histogram(data = tibble(y = y), aes(x = y)) +
+  theme_bw() +
+  labs(title = "Simulated data, mu = 0, sigma = 2")
+```
+
+## Gibbs sampler
+
+```{r}
+# num_mcmc = 5000
+# seed = 05172022
+normal_gibbs <- function(num_mcmc, warmup = num_mcmc/2, y, seed = NULL){
+  
+  if(!is.null(seed)) set.seed(seed)
+  
+  # convenience
+  n <- length(y)
+  sum_y <- sum(y)
+  
+  # storage
+  mu_mcmc <- matrix(NA, num_mcmc, 1)
+  sigma_mcmc <- matrix(NA, num_mcmc, 1)
+  
+  # priors
+  mu0 <- 0
+  tau0 <- 100
+  a0 <- .01
+  b0 <- .01
+  
+  # initialize
+  mu <- rnorm(1, mu0, tau0); mu_mcmc[1,] <- mu
+  sigma <- invgamma::rinvgamma(1, a0, b0); sigma_mcmc[1,] <- sigma
+  
+  # sampler
+  pb <- txtProgressBar(min = 0, max = num_mcmc, style = 3, width = 50, char = "=") 
+  for(iter in 2:num_mcmc){
+    # mu
+    v <- solve(1/tau0^2 + n/sigma^2)
+    m <- v * (mu0 / tau0^2 + sum_y / sigma^2)
+    mu <- rnorm(1, m, sqrt(v))
+    
+    # sigma
+    a <- a0 + n/2
+    b <- b0 + sum((y-mu)^2)/2
+    sigma <- sqrt(invgamma::rinvgamma(1, a, b))
+    
+    # storage
+    mu_mcmc[iter,] <- mu
+    sigma_mcmc[iter,] <- sigma
+    
+    # progress
+    setTxtProgressBar(pb, iter)
+  }
+  close(pb)
+  
+  samples <- list(
+    mu = mu_mcmc[(warmup+1):num_mcmc,],
+    sigma = sigma_mcmc[(warmup+1):num_mcmc,]
+  )
+  
+  return(samples)
+  
+}
+
+samples <- normal_gibbs(num_mcmc = 5000, y = y, seed = 05172022)
+```
+
+```{r, echo = T}
+mean(samples$mu)
+mean(samples$sigma)
+```
+
+# Multivariate normal 
+
+```{r}
+nimble_summary <- function(fit, warmup = nrow(fit[[1]])/2, thin = 1){
+  # convert to coda for normal summary
+  fit_warmup <- lapply(fit, function(x) x[(warmup+1):nrow(x),])
+  coda_samples <- as.mcmc.list(lapply(fit_warmup, function(x) as.mcmc(
+    x, start = warmup+1, end = nrow(fit), thin = thin
+  )))
+  
+  sum <- summary(coda_samples)
+  params <- dimnames(sum$statistics)[[1]]
+  tmp_sum <- cbind(sum$statistics, sum$quantiles)
+  
+  # get r hat / n_eff
+  mat <- matrix(NA, nrow = nrow(tmp_sum), ncol = 3)
+  colnames(mat) <- c("Rhat", "ess_bulk", "ess_tail")
+  for(i in 1:nrow(tmp_sum)){
+    tmp <- sapply(fit, function(x) x[,i])
+    mat[i,] <- c(Rhat(tmp), ess_bulk(tmp), ess_tail(tmp))
+  }
+  
+  # out 
+  out <- cbind(tmp_sum, mat)
+  return(out)
+}
+
+sim_reg <- function(n, beta, X, sigma, Omega = diag(n), seed = NULL){
+  if(!is.null(seed)) set.seed(seed)
+  
+  mu <- X %*% beta
+  Sigma <- sigma^2 * Omega + diag(.00001, n, n)
+  # y <- chol(Sigma) %*% rnorm(n) + mu
+  y <- c(mvtnorm::rmvnorm(1, mu, Sigma))
+  
+  df <- cbind(
+    y,
+    X[,2:ncol(X), drop=FALSE]
+  ) %>%
+    as_tibble
+  
+  names(df)[2:ncol(df)] <- paste0("x", 1:(ncol(X)-1))
+
+  return(
+    df
+  )
+}
+```
+
+## Ordinary least squares regression
+
+\[
+\begin{split}
+\boldsymbol{y} \sim \mathcal{N}(X\boldsymbol{\beta}, \sigma^2 \boldsymbol{I}_n)
+\end{split}
+\]
+
+### Simulated data
+
+```{r}
+n <- 500
+y <- sim_reg(
+  n = n, 
+  X = matrix(1, nrow = n),
+  beta = 0,
+  sigma = 2, 
+  Omega = diag(n),
+  seed = 05172022
+)
+ggplot() + 
+  geom_histogram(data = tibble(y = y), aes(x = y)) +
+  theme_bw() +
+  labs(title = "Simulated data, beta = 0, sigma = 2, Omega = diag(n)")
+```
+
+### Gibbs sampler
+
+```{r}
+# num_mcmc = 5000
+# seed = 05172022
+# Omega = diag(nrow(y))
+# X = matrix(1, nrow = n)
+ols_gibbs <- function(num_mcmc, warmup = num_mcmc/2, y, X_, Omega, seed = NULL){
+  
+  if(!is.null(seed)) set.seed(seed)
+  
+  # convenience
+  n <- nrow(X_)
+  p <- ncol(X_)
+  
+  # storage
+  sigma_mcmc <- matrix(NA, num_mcmc, 1)
+  beta_mcmc <- matrix(NA, num_mcmc, p)
+  
+  # priors
+  mu0 <- matrix(0, nrow = p, ncol = 1)
+  Sigma0 <- matrix(1000, nrow = p, ncol = p)
+  Sigma0_inv <- solve(Sigma0)
+  prior_prod <- Sigma0_inv %*% mu0
+  a0 <- .01
+  b0 <- .01
+  
+  # more convenience
+  XtX <- t(X_) %*% X_
+  Xty <- t(X_) %*% y
+  
+  # initialize
+  beta <- chol(Sigma0) %*% rnorm(p) + mu0; beta_mcmc[1,] <- beta
+  sigma <- invgamma::rinvgamma(1, a0, b0); sigma_mcmc[1,] <- sigma
+  sigma2 <- sigma^2
+  
+  # sampler
+  pb <- txtProgressBar(min = 0, max = num_mcmc, style = 3, width = 50, char = "=") 
+  for(iter in 2:num_mcmc){
+    # beta
+    ## assuming Omega is always identity
+    V <- solve(1/sigma2 * XtX + Sigma0_inv)
+    m <- V %*% (1/sigma2 * Xty + prior_prod)
+    
+    beta <- chol(V) %*% rnorm(p) + m
+    Xb <- X_ %*% beta
+    
+    # sigma
+    a <- a0 + n/2
+    b <- c(b0 + .5 * t(y - Xb) %*% (y - Xb))
+    sigma <- sqrt(invgamma::rinvgamma(1, a, b))
+    sigma2 <- sigma^2
+    
+    # storage
+    beta_mcmc[iter,] <- beta
+    sigma_mcmc[iter,] <- sigma
+    
+    # progress
+    setTxtProgressBar(pb, iter)
+  }
+  close(pb)
+  
+  samples <- cbind(
+    beta = beta_mcmc[(warmup+1):num_mcmc,],
+    sigma = sigma_mcmc[(warmup+1):num_mcmc,]
+  )
+  
+  return(samples)
+  
+}
+samples <- ols_gibbs(
+  num_mcmc = 5000, 
+  y = y, 
+  X_ = matrix(1, nrow = n),
+  Omega = diag(n),
+  seed = 05172022
+)
+```
+
+```{r, echo = T}
+mean(samples[,1])
+quantile(samples[,1], c(0.025, 0.975))
+
+mean(samples[,2])
+quantile(samples[,2], c(0.025, 0.975))
+```
+
+### Simulation with synthetic data
+
+```{r, eval = F}
+library(parallel)
+sim_ols <- function(nsims, n = 400){
+    # convenience function
+  nimble_summary <- function(fit, warmup = nrow(fit[[1]])/2, thin = 1){
+    # convert to coda for normal summary
+    fit_warmup <- lapply(fit, function(x) x[(warmup+1):nrow(x),])
+    coda_samples <- as.mcmc.list(lapply(fit_warmup, function(x) as.mcmc(
+      x, start = warmup+1, end = nrow(fit), thin = thin
+    )))
+    
+    sum <- summary(coda_samples)
+    params <- dimnames(sum$statistics)[[1]]
+    tmp_sum <- cbind(sum$statistics, sum$quantiles)
+    
+    # get r hat / n_eff
+    mat <- matrix(NA, nrow = nrow(tmp_sum), ncol = 3)
+    colnames(mat) <- c("Rhat", "ess_bulk", "ess_tail")
+    for(i in 1:nrow(tmp_sum)){
+      tmp <- sapply(fit, function(x) x[,i])
+      mat[i,] <- c(Rhat(tmp), ess_bulk(tmp), ess_tail(tmp))
+    }
+    
+    # out 
+    out <- cbind(tmp_sum, mat)
+    return(out)
+  }
+  
+  sum_tbl <- list()
+  pb <- txtProgressBar(min = 0, max = nsims, style = 3, width = 50, char = "=")
+  for(sim in 1:nsims){
+    # simulate data
+    dat <- sim_reg(
+      n = n, 
+      X = matrix(1, nrow = n),
+      beta = 0,
+      sigma = 2, 
+      Omega = diag(n),
+      seed = sim
+    )
+    
+    # fit model - parallel
+    tmp_sim <- sim
+    this_cluster <- makeCluster(3)
+    fit <- parLapply(
+      cl = this_cluster,
+      X = 1:3,
+      fun = ols_gibbs,
+      num_mcmc = 5000,
+      warmup = 2500,
+      y = dat, 
+      X_ = matrix(1, nrow = n, ncol = 1),
+      Omega = diag(n)
+    )
+    stopCluster(this_cluster)
+
+    sum <- nimble_summary(fit, warmup = 0)
+    sum_tbl[[sim]] <- tibble(
+      param = rownames(sum),
+      truth = c(0, 2),
+      mean = sum[,1],
+      lwr = sum[,5],
+      upr = sum[,9],
+      rhat = sum[,10],
+      ess_bulk = sum[,11],
+      ess_tail = sum[,12]
+    ) %>%
+      mutate(sim = tmp_sim)
+    
+    setTxtProgressBar(pb, sim)
+  }
+  close(pb)
+  
+  return(do.call("bind_rows", sum_tbl))
+}
+ols_sims <- sim_ols(100, 400)
+saveRDS(ols_sims, "ols_sims.rds")
+```
+
+```{r}
+ols_sims <- readRDS("ols_sims.rds")
+ols_sims %>%
+  mutate(
+    capture = factor(case_when(
+      truth >= lwr & truth <= upr ~ 1, 
+      TRUE ~ 0
+    ))
+  ) %>%
+  ggplot() + 
+  geom_linerange(
+    aes(xmin = lwr, xmax = upr, x = mean, col = capture, y = sim)
+  ) +
+  facet_wrap(~ param) +
+  theme_bw()
+```
+
+## Generalized least squares regression
+
+\[
+\begin{split}
+\boldsymbol{y} &\sim \mathcal{N}(X\boldsymbol{\beta}, \boldsymbol{\Sigma}) \\
+\boldsymbol{\Sigma} &= \sigma^2\boldsymbol{\Omega}, \boldsymbol{\Omega}\text{ known}
+\end{split}
+\]
+
+### Simulated data
+
+```{r}
+df <- sim_reg(
+  n = 400, 
+  X = cbind(
+    rep(1, 400),
+    rnorm(400)
+  ),
+  beta = c(0, 1),
+  sigma = 2, 
+  Omega = exp(-as.matrix(dist(1:400))^2/4),
+  seed = 2
+)
+
+df %>%
+  ggplot() +
+  geom_point(aes(x = x1, y = y)) +
+  theme_bw()
+
+# ggplot() + 
+#   geom_histogram(data = tibble(y = y), aes(x = y)) +
+#   theme_bw() +
+#   labs(title = "Simulated data, beta = 0, sigma = 2, tau = 1, Omega = exp(-as.matrix(dist(1:n)^2)/25)")
+
+# stan(
+#   file = 'stan programs/invgamPars.stan',
+#   data = list(l=1.5, u=16),
+#   iter = 1,
+#   warmup = 0,
+#   chains = 1,
+#   algorithm = "Fixed_param"
+# )
+# 4.4, 16
+```
+
+### Gibbs sampler
+
+```{r}
+# num_mcmc = 5000
+# seed = 05172022
+# Omega = diag(nrow(y))
+# X = matrix(1, nrow = n)
+gls_gibbs <- function(seed, num_mcmc, warmup = num_mcmc/2, y, X_, Omega){
+  # hoff text pg 189 for reassurance
+  
+  # seed
+  set.seed(seed)
+  
+  # convenience
+  n <- nrow(X_)
+  p <- ncol(X_)
+  
+  # storage
+  sigma_mcmc <- matrix(NA, num_mcmc, 1)
+  beta_mcmc <- matrix(NA, num_mcmc, p)
+  
+  # priors
+  mu0 <- matrix(0, nrow = p, ncol = 1)
+  Sigma0 <- 1000 * diag(1, p, p)
+  Sigma0_inv <- solve(Sigma0)
+  prior_prod <- Sigma0_inv %*% mu0
+  a0 <- .1
+  b0 <- .1
+  
+  # initialize
+  beta <- chol(Sigma0) %*% rnorm(p) + mu0; beta_mcmc[1,] <- beta
+  # beta <- mvtnorm::rmvnorm(1, mu0, Sigma0); beta_mcmc[1,] <- beta
+  sigma <- invgamma::rinvgamma(1, a0, b0); sigma_mcmc[1,] <- sigma
+  sigma2 <- sigma^2
+  Omega_inv <- solve(Omega + diag(.00001, n, n))
+  
+  # more convenience
+  XtX <- t(X_) %*% X_
+  XtOX <- t(X_) %*% Omega_inv %*% X_
+  Xty <- t(X_) %*% y
+  XtOy <- t(X_) %*% Omega_inv %*% y
+  
+  # sampler
+  pb <- txtProgressBar(min = 0, max = num_mcmc, style = 3, width = 50, char = "=")
+  for(iter in 2:num_mcmc){
+    # beta
+    V <- solve(1/sigma2 * XtOX + Sigma0_inv)
+    m <- V %*% (1/sigma2 * XtOy + prior_prod)
+    
+    beta <- chol(V) %*% rnorm(p) + m
+    # beta <- matrix(c(mvtnorm::rmvnorm(1, m, V)), ncol = 1)
+    Xb <- X_ %*% beta
+    
+    # sigma
+    a <- a0 + n/2
+    # a <- (a0 + n)/2
+    b <- c(b0 + .5 * t(y - Xb) %*% Omega_inv %*% (y - Xb))
+    # b <- (a0*b0 + t(y - Xb) %*% Omega_inv %*% (y - Xb))/2
+    sigma <- sqrt(invgamma::rinvgamma(1, a, b))
+    sigma2 <- sigma^2
+    
+    # storage
+    beta_mcmc[iter,] <- beta
+    sigma_mcmc[iter,] <- sigma
+    
+    # progress
+    setTxtProgressBar(pb, iter)
+  }
+  close(pb)
+  
+  samples <- cbind(
+    beta_mcmc[(warmup+1):num_mcmc,],
+    sigma_mcmc[(warmup+1):num_mcmc,]
+  )
+  
+  colnames(samples) <- c(paste0(rep("beta[", p), 1:p, rep("]", p)), "sigma")
+  
+  return(samples)
+  
+}
+
+samples <- gls_gibbs(
+  num_mcmc = 1000, 
+  y = df$y, 
+  X_ = cbind(
+    rep(1, nrow(df)),
+    df$x1
+  ),
+  Omega = exp(-as.matrix(dist(1:nrow(df))^2)/4),
+  seed = 102
+)
+```
+
+```{r, echo = T}
+# beta - 0
+mean(samples[,1])
+quantile(samples[,1], c(0.025, 0.975))
+
+# btea[2] - 1
+mean(samples[,2])
+quantile(samples[,2], c(0.025, 0.975))
+
+# sigma - 1
+mean(samples[,3])
+quantile(samples[,3], c(0.025, 0.975))
+```
+
+### Simulation with synthetic data
+
+```{r, eval = F}
+library(parallel)
+sim_gls <- function(nsims, n = 400){
+  sum_tbl <- list()
+  pb <- txtProgressBar(min = 0, max = nsims, style = 3, width = 50, char = "=")
+  for(sim in 1:nsims){
+    # simulate data
+    df <- sim_reg(
+      n = n, 
+      X = cbind(
+        rep(1, n),
+        rnorm(n)
+      ),
+      beta = c(0, 1),
+      sigma = 2, 
+      Omega = exp(-as.matrix(dist(1:n))^2/4),
+      seed = sim
+    )
+    
+    # fit model - parallel
+    tmp_sim <- sim
+    this_cluster <- makeCluster(3)
+    fit <- parLapply(
+      cl = this_cluster,
+      X = 1:3,
+      fun = gls_gibbs,
+      num_mcmc = 5000,
+      warmup = 2500,
+      y = df$y, 
+      X_ = cbind(
+        rep(1, nrow(df)),
+        df$x1
+      ),
+      Omega = exp(-as.matrix(dist(1:n)^2)/4)
+    )
+    stopCluster(this_cluster)
+
+    sum <- nimble_summary(fit, warmup = 0)
+    sum_tbl[[sim]] <- tibble(
+      param = rownames(sum),
+      truth = c(0, 1, 2),
+      mean = sum[,1],
+      lwr = sum[,5],
+      upr = sum[,9],
+      rhat = sum[,10],
+      ess_bulk = sum[,11],
+      ess_tail = sum[,12]
+    ) %>%
+      mutate(sim = tmp_sim)
+    
+    setTxtProgressBar(pb, sim)
+  }
+  close(pb)
+  
+  return(do.call("bind_rows", sum_tbl))
+}
+gls_sims <- sim_gls(100, 400)
+saveRDS(gls_sims, "gls_sims.rds")
+```
+
+```{r}
+gls_sims <- readRDS("gls_sims.rds")
+gls_sims %>%
+  mutate(
+    capture = factor(case_when(
+      truth >= lwr & truth <= upr ~ 1, 
+      TRUE ~ 0
+    ))
+  ) %>%
+  ggplot() + 
+  geom_linerange(
+    aes(xmin = lwr, xmax = upr, x = mean, col = capture, y = sim)
+  ) +
+  facet_wrap(~ param, scales = "free") +
+  theme_bw()
+```
+
+# Gaussian processes
+
+```{r}
+nimble_summary <- function(fit, warmup = nrow(fit[[1]])/2, thin = 1){
+  # convert to coda for normal summary
+  fit_warmup <- lapply(fit, function(x) x[(warmup+1):nrow(x),])
+  coda_samples <- as.mcmc.list(lapply(fit_warmup, function(x) as.mcmc(
+    x, start = warmup+1, end = nrow(fit), thin = thin
+  )))
+  
+  sum <- summary(coda_samples)
+  params <- dimnames(sum$statistics)[[1]]
+  tmp_sum <- cbind(sum$statistics, sum$quantiles)
+  
+  # get r hat / n_eff
+  mat <- matrix(NA, nrow = nrow(tmp_sum), ncol = 3)
+  colnames(mat) <- c("Rhat", "ess_bulk", "ess_tail")
+  for(i in 1:nrow(tmp_sum)){
+    tmp <- sapply(fit, function(x) x[,i])
+    mat[i,] <- c(Rhat(tmp), ess_bulk(tmp), ess_tail(tmp))
+  }
+  
+  # out 
+  out <- cbind(tmp_sum, mat)
+  return(out)
+}
+sim_gp <- function(n = 100, seed = 1, sigma = 1, phi = 1, X = matrix(1, nrow = n), beta = 0, delta = 1e-9){
+  # function to simulated occupancy on a square grid
+  
+  # useful functions
+  distance <- function(x){
+    dist.vec <- parallelDist::parDist(x)
+    dist <- as.matrix(dist.vec)
+    return(dist)
+  }
+
+  # housekeeping
+  if((sqrt(n) %% 1) != 0) stop("n should be a perfect square")
+  set.seed(seed)
+  
+  # create grid
+  sfc <- st_sfc(st_polygon(list(rbind(c(0,0), c(sqrt(n),0), c(sqrt(n),sqrt(n)), c(0,0)))))
+  grid <- st_as_sf(st_make_grid(sfc, cellsize = 1, square = TRUE)) %>% as_tibble
+  names(grid) <- "geometry"
+  rm(sfc)
+  
+  # spatial random effects
+  coords <- grid %>%
+    st_as_sf %>%
+    st_centroid %>%
+    st_coordinates
+  
+  dist_mat <- coords %>%
+    as.matrix %>%
+    distance
+  
+  # dist_mat <- dist_mat / max(dist_mat) # normalize max dist to 1
+  
+  Sigma <- sigma^2 * exp(-dist_mat^2 / (2*phi^2)) + diag(delta, dim(dist_mat))
+  grid$y <- c(mvtnorm::rmvnorm(1, X %*% beta, Sigma))
+  # grid$y <- c(chol(Sigma) %*% rnorm(n) + X %*% beta) 
+
+  out <- list(
+    df = grid,
+    params = list(
+      phi = phi, sigma = sigma, phi = phi, beta = beta
+    ),
+    dist_mat = dist_mat,
+    coords = coords
+  )
+  
+  return(out)
+}
+```
+
+## Normal response
+
+\[
+\begin{split}
+\boldsymbol{y} &\sim \mathcal{N}(X\boldsymbol{\beta}, \boldsymbol{\Sigma}) \\
+\boldsymbol{\Sigma} &= \sigma^2 \exp\left(-\frac{d_{ij}^2}{2\phi^2}\right)
+\end{split}
+\]
+
+### Simulated data
+
+```{r}
+sim_dat <- sim_gp(n = 10^2, sigma = 1, phi = 2, seed = 06292022, delta = 1e-9)
+
+sim_dat$df %>%
+  st_as_sf %>% 
+  ggplot() +
+  geom_sf(aes(fill = y)) +
+  labs(
+    title = "Simulated response (y)",
+    subtitle = bquote(beta == 0 ~ "," ~ sigma == 1 ~ "," ~ phi == 2)
+  ) +
+  theme_bw()
+
+
+# stan(
+#   file = 'stan programs/invgamPars.stan',
+#   data = list(l=1.1, u=13),
+#   iter = 1,
+#   warmup = 0,
+#   chains = 1,
+#   algorithm = "Fixed_param"
+# ) # 4, 11.2
+# curve(dinvgamma(x, .01, .01), from = 0, to = 11.2)
+# pinvgamma(2, 5, 11.2)
+```
+
+### Metropolis within Gibbs sampler
+
+```{r}
+# num_mcmc = 5000
+# seed = 05172022
+# X_ = matrix(1, nrow = length(sim_dat$df$y))
+# y <- sim_dat$df$y
+# warmup = num_mcmc/2
+# phi_a = 4
+# phi_b = 11.2
+# sigma_a = .1
+# sigma_b = .1
+# dist <- sim_dat$dist_mat
+# delta = 1e-9
+# prop_sd = .1
+
+gp_mhgibbs <- function(
+    seed, num_mcmc, warmup = num_mcmc/2, y, X_, dist, 
+    phi_a = .1, phi_b = .1, sigma_a = .1, sigma_b = .1,
+    delta = .0001, 
+    initial_prop_var = .01, adapt = TRUE, adapt_period = .1*num_mcmc, sd = 2.4^2, epsilon = 1e-9){
+  # hoff text pg 189 for reassurance on posteriors
+  # heikki haario (2001) - An adaptive Metropolis algorithm
+  
+  # seed
+  set.seed(seed)
+  
+  # convenience
+  n <- nrow(X_)
+  p <- ncol(X_)
+  
+  # storage
+  sigma_mcmc <- matrix(NA, num_mcmc, 1)
+  phi_mcmc <- matrix(NA, num_mcmc, 1)
+  accept_ratio <- matrix(0, num_mcmc, 1)
+  beta_mcmc <- matrix(NA, num_mcmc, p)
+  
+  # priors
+  mu0 <- matrix(0, nrow = p, ncol = 1)
+  Sigma0 <- 100 * diag(1, p, p)
+  Sigma0_inv <- solve(Sigma0)
+  prior_prod <- Sigma0_inv %*% mu0
+  a0 <- sigma_a
+  b0 <- sigma_b
+  
+  # initialize
+  beta <- chol(Sigma0) %*% rnorm(p) + mu0; beta_mcmc[1,] <- beta
+  sigma <- invgamma::rinvgamma(1, a0, b0); sigma_mcmc[1,] <- sigma
+  sigma2 <- sigma^2
+  phi <- invgamma::rinvgamma(1, phi_a, phi_b); phi_mcmc[1,] <- phi
+  phi2 <- phi^2
+  Omega <- exp(-dist^2/(2*phi2)) + diag(delta, n, n)
+  Omega_inv <- solve(Omega)
+
+  XtOX <- t(X_) %*% Omega_inv %*% X_
+  XtOy <- t(X_) %*% Omega_inv %*% y
+  
+  # adaptive
+  Ct <- initial_prop_var
+  
+  # sampler
+  message(paste0("Beginning sampling at "), Sys.time())
+  pb <- txtProgressBar(min = 0, max = num_mcmc, style = 3, width = 50, char = "=")
+  for(iter in 2:num_mcmc){
+    # beta
+    V <- solve(1/sigma2 * XtOX + Sigma0_inv) + diag(delta, p, p)
+    m <- V %*% (1/sigma2 * XtOy + prior_prod)
+    
+    beta <- chol(V) %*% rnorm(p) + m
+    Xb <- X_ %*% beta
+    
+    # sigma
+    a <- a0 + n/2
+    b <- c(b0 + .5 * t(y - Xb) %*% Omega_inv %*% (y - Xb))
+    sigma <- sqrt(invgamma::rinvgamma(1, a, b))
+    sigma2 <- sigma^2
+    
+    # phi - metropolis
+    ## adaptive
+    if(adapt){
+      if(iter <= adapt_period){
+        Ct <- initial_prop_var
+      } else if(iter > adapt_period){
+        Ct <- sd * cov(phi_mcmc[1:(iter-1),,drop = F]) + sd * epsilon
+      }
+    }
+    
+    ## proposal
+    phi_s <- -1
+    while(phi_s <= 0) phi_s <- phi + rnorm(1, 0, sqrt(Ct))
+    phi2_s <- phi_s^2
+    Omega_s <- exp(-dist^2/(2*phi2_s)) + diag(delta, n, n)
+
+    ## evaluate proposal
+    log_post_current <- mvtnorm::dmvnorm(y, Xb, sigma2 * Omega, log = T) + invgamma::dinvgamma(phi, phi_a, phi_b, log = T)
+    log_post_s <- mvtnorm::dmvnorm(y, Xb, sigma2 * Omega_s, log = T) + invgamma::dinvgamma(phi_s, phi_a, phi_b, log = T)
+    log_r <- log_post_s - log_post_current
+    if(log(runif(1)) < log_r){
+      phi <- phi_s
+      phi2 <- phi_s^2
+      Omega <- exp(-dist^2/(2*phi2)) + diag(delta, n, n)
+      Omega_inv <- solve(Omega)
+      XtOX <- t(X_) %*% Omega_inv %*% X_
+      XtOy <- t(X_) %*% Omega_inv %*% y
+
+      accept_ratio[iter,] <- 1
+    }
+    
+    # storage
+    beta_mcmc[iter,] <- beta
+    sigma_mcmc[iter,] <- sigma
+    phi_mcmc[iter,] <- phi
+    
+    # progress
+    setTxtProgressBar(pb, iter)
+  }
+  close(pb)
+  message(paste0("Ending sampling at "), Sys.time())
+  
+  samples <- cbind(
+    beta_mcmc[(warmup+1):num_mcmc,],
+    sigma_mcmc[(warmup+1):num_mcmc,],
+    phi_mcmc[(warmup+1):num_mcmc,]
+  )
+  
+  colnames(samples) <- c(paste0(rep("beta[", p), 1:p, rep("]", p)), "sigma", "phi")
+  
+  return(
+    list(
+      samples = samples,
+      accept_ratio = accept_ratio
+    )
+  )
+  
+}
+
+# curve(dinvgamma(x, .01, sd(sim_dat$df$y)), 0, 10)
+
+# parallel
+this_cluster <- makeCluster(3)
+samples <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = gp_mhgibbs,
+  num_mcmc = 100000,
+  warmup = 50000,
+  y = sim_dat$df$y, 
+  X_ = cbind(
+    rep(1, nrow(sim_dat$df))
+  ),
+  dist = sim_dat$dist_mat,
+  phi_a = 4,
+  phi_b = 11.2,
+  sigma_a = 1,
+  sigma_b = 1,
+  initial_prop_var = .05^2,
+  adapt = FALSE,
+  delta = 1e-09
+)
+stopCluster(this_cluster)
+
+saveRDS(samples, "gibbs_gp.rds")
+```
+
+```{r, echo = T}
+colMeans(samples[[1]]$accept_ratio)
+nimble_summary(list(samples[[1]]$samples, samples[[2]]$samples, samples[[3]]$samples), warmup = 0)
+
+# # beta - 0
+# mean(samples[[1]][,1])
+# quantile(samples[[1]][,1], c(0.025, 0.975))
+# plot(samples[[1]][,1], type = "l")
+# 
+# # sigma - 1
+# mean(samples[[1]][,2])
+# quantile(samples[[1]][,2], c(0.025, 0.975))
+# plot(samples[[1]][,2], type = "l")
+# 
+# # phi - 2
+# mean(samples[[1]][,3])
+# quantile(samples[[1]][,3], c(0.025, 0.975))
+plot(samples[[1]][[1]][,2], type = "l")
+lines(samples[[2]][[1]][,2], type = "l", col = 2)
+lines(samples[[3]][[1]][,2], type = "l", col = 3)
+
+plot(samples[[1]][[1]][,3], type = "l")
+lines(samples[[2]][[1]][,3], type = "l", col = 2)
+lines(samples[[3]][[1]][,3], type = "l", col = 3)
+```
+
+### Stan
+
+```{r}
+fit <- stan(
+  file = "stan programs/gp.stan",
+  data = list(
+    N = length(sim_dat$df$y),
+    p = 1,
+    X = matrix(1, nrow = 100, ncol = 1),
+    y = c(sim_dat$df$y),
+    coords = sim_dat$coords
+  ),
+  iter = 5000,
+  warmup = 2500,
+  chains = 3, 
+  include = TRUE,
+  pars = c("sigma", "beta", "phi")
+)
+saveRDS(fit, "stan fits/gp.rds")
+```
+
+```{r}
+fit2 <- readRDS("stan fits/gp.rds")
+summary(fit2)$summary
+```
+
+### Simulated data
+
+```{r}
+sim_dat <- sim_gp(n = 10^2, sigma = 1, phi = 3, seed = 06302022, delta = 1e-9)
+
+# (2, 3): gibbs good - 06292022, 06302022
+
+sim_dat$df %>%
+  st_as_sf %>% 
+  ggplot() +
+  geom_sf(aes(fill = y)) +
+  labs(
+    title = "Simulated response (y)",
+    subtitle = bquote(beta == 0 ~ "," ~ sigma == 1 ~ "," ~ phi == 2)
+  ) +
+  theme_bw()
+
+
+# stan(
+#   file = 'stan programs/invgamPars.stan',
+#   data = list(l=1.1, u=13),
+#   iter = 1,
+#   warmup = 0,
+#   chains = 1,
+#   algorithm = "Fixed_param"
+# ) # 4, 11.2
+# curve(dinvgamma(x, .01, .01), from = 0, to = 11.2)
+# pinvgamma(2, 5, 11.2)
+```
+
+### Metropolis within Gibbs sampler
+
+```{r}
+# parallel
+this_cluster <- makeCluster(3)
+samples <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = gp_mhgibbs,
+  num_mcmc = 15000,
+  warmup = 10000,
+  y = sim_dat$df$y, 
+  X_ = cbind(
+    rep(1, nrow(sim_dat$df))
+  ),
+  dist = sim_dat$dist_mat,
+  phi_a = 1,
+  phi_b = 1,
+  sigma_a = 1,
+  sigma_b = 1,
+  initial_prop_var = .05^2,
+  adapt = FALSE,
+  delta = 1e-09
+)
+stopCluster(this_cluster)
+
+saveRDS(samples, "gibbs_gp2.rds")
+```
+
+```{r, echo = T}
+colMeans(samples[[1]]$accept_ratio)
+nimble_summary(list(samples[[1]]$samples, samples[[2]]$samples, samples[[3]]$samples), warmup = 0)
+
+# # beta - 0
+# mean(samples[[1]][,1])
+# quantile(samples[[1]][,1], c(0.025, 0.975))
+# plot(samples[[1]][,1], type = "l")
+# 
+# # sigma - 1
+# mean(samples[[1]][,2])
+# quantile(samples[[1]][,2], c(0.025, 0.975))
+# plot(samples[[1]][,2], type = "l")
+# 
+# # phi - 2
+# mean(samples[[1]][,3])
+# quantile(samples[[1]][,3], c(0.025, 0.975))
+plot(samples[[1]][[1]][,2], type = "l")
+lines(samples[[2]][[1]][,2], type = "l", col = 2)
+lines(samples[[3]][[1]][,2], type = "l", col = 3)
+
+plot(samples[[1]][[1]][,3], type = "l")
+lines(samples[[2]][[1]][,3], type = "l", col = 2)
+lines(samples[[3]][[1]][,3], type = "l", col = 3)
+```
+
+### Stan
+
+```{r}
+fit <- stan(
+  file = "stan programs/gp.stan",
+  data = list(
+    N = length(sim_dat$df$y),
+    p = 1,
+    X = matrix(1, nrow = 100, ncol = 1),
+    y = c(sim_dat$df$y),
+    coords = sim_dat$coords
+  ),
+  iter = 5000,
+  warmup = 2500,
+  chains = 3, 
+  include = TRUE,
+  pars = c("sigma", "beta", "phi")
+)
+saveRDS(fit, "stan fits/gp2.rds")
+```
+
+```{r}
+fit2 <- readRDS("stan fits/gp2.rds")
+summary(fit2)$summary
+```
+
+### Simulation with synthetic data - (1, 3)
+
+```{r, eval = F}
+library(parallel)
+gp_sim <- function(nsims, n = 100){
+  sum_tbl <- list()
+  pb <- txtProgressBar(min = 0, max = nsims, style = 3, width = 50, char = "=")
+  for(sim in 1:nsims){
+    # simulate data
+    sim_dat <- sim_gp(
+      n = n, 
+      sigma = 1, 
+      phi = 3, 
+      seed = sim,
+      delta = 1e-9
+    )
+    
+    # fit model - parallel
+    tmp_sim <- sim
+    this_cluster <- makeCluster(3)
+    fit <- parLapply(
+      cl = this_cluster,
+      X = 1:3,
+      fun = gp_mhgibbs,
+      num_mcmc = 15000,
+      warmup = 10000,
+      y = sim_dat$df$y, 
+      X_ = cbind(
+        rep(1, nrow(sim_dat$df))
+      ),
+      dist = sim_dat$dist_mat,
+      phi_a = 1,
+      phi_b = 1,
+      sigma_a = 1,
+      sigma_b = 1,
+      initial_prop_var = .05^2,
+      adapt = FALSE,
+      delta = 1e-09
+    )
+    stopCluster(this_cluster)
+    
+    sum <- nimble_summary(list(fit[[1]]$samples, fit[[2]]$samples, fit[[3]]$samples), warmup = 0)
+    sum_tbl[[sim]] <- tibble(
+      param = rownames(sum),
+      truth = c(0, 1, 3),
+      mean = sum[,1],
+      lwr = sum[,5],
+      upr = sum[,9],
+      rhat = sum[,10],
+      ess_bulk = sum[,11],
+      ess_tail = sum[,12]
+    ) %>%
+      mutate(sim = tmp_sim)
+    
+    setTxtProgressBar(pb, sim)
+  }
+  close(pb)
+  
+  return(do.call("bind_rows", sum_tbl))
+}
+gp_sims <- gp_sim(100, 100)
+saveRDS(gp_sims, "gp_sims_1_3.rds")
+```
+
+```{r}
+gp_sims <- readRDS("gp_sims_1_3.rds")
+gp_sims %>%
+  mutate(
+    capture = factor(case_when(
+      truth >= lwr & truth <= upr ~ 1, 
+      TRUE ~ 0
+    ))
+  ) %>%
+  ggplot() + 
+  geom_linerange(
+    aes(xmin = lwr, xmax = upr, x = mean, col = capture, y = sim)
+  ) +
+  facet_wrap(~ param, scales = "free_x") +
+  theme_bw()
+```
+
+
+
+## Prediction
+
+\[
+\begin{split}
+\boldsymbol{y} &\sim \mathcal{N}(X\boldsymbol{\beta}, \boldsymbol{\Sigma}), \hspace{5mm}
+\boldsymbol{\Sigma} &= \sigma^2 \exp\left(-\frac{d_{ij}^2}{2\phi^2}\right)
+\end{split}
+\]
+
+# Count occupancy models
+
+## Three-stage count occupancy
+
+\[
+\begin{split}
+z_i &\sim \text{Bernoulli}(\psi_i), \hspace{5mm} \text{logit}(\psi_i) = x_i'\beta, \\
+a_{ij} &\sim \text{Bernoulli}(z_i \theta_{ij}), \hspace{5mm} \text{logit}(\theta_{ij}) = w_{ij}' \alpha \\
+y_{ijk} &\sim \text{NegBin}(r, a_{ij} p_{ijk}), \hspace{5mm} \text{logit}(p_{ijk}) = v_{ijk}' \delta
+\end{split}
+\]
+where the $\text{NegBin}(r,p)$ distribution has density
+\[
+\begin{split}
+p(y | r, p) &= {y+r-1\choose y}  p^r (1 - p)^y \\
+&\propto p^r (1 - p)^y
+\end{split}
+\]
+Note that assuming $\text{logit}(p_i) = x_i\beta$, $p_i^r (1 - p_i)^{y_i} = \frac{[\exp(x_i\beta)]^r}{[1 + \exp(x_i\beta)]^{y_i + r}}$.
+
+### Simulated data
+
+```{r}
+sim_msocc_counts <- function(n = 100, j = 4, k = 8, seed = 1, delta_var = 1){
+  # function to simulated occupancy on a square grid
+  
+  # housekeeping
+  if((sqrt(n) %% 1) != 0) stop("n should be a perfect square")
+  set.seed(seed)
+  
+  # create grid
+  sfc <- st_sfc(st_polygon(list(rbind(c(0,0), c(sqrt(n),0), c(sqrt(n),sqrt(n)), c(0,0)))))
+  grid <- st_as_sf(st_make_grid(sfc, cellsize = 1, square = TRUE)) %>% as_tibble
+  names(grid) <- "geometry"
+  rm(sfc)
+  
+  # create occupancy covariates
+  grid$x <- rnorm(n)
+  X <- cbind(rep(1, n), grid$x)
+  
+  # generate occupancy
+  beta <- rnorm(2)
+  grid$z <- rbinom(n, 1, prob = exp(X %*% beta) / (1 + exp(X %*% beta)))
+  
+  # add availability
+  alpha <- rnorm(2)
+  df <- grid %>%
+    mutate(site = 1:n()) %>%
+    mutate(nsamples = j) %>%
+    uncount(nsamples) %>%
+    mutate(visit = rep(1:j, n)) %>%
+    mutate(w = rnorm(n())) 
+  W <- cbind(rep(1, nrow(df)), df$w)
+  df$a <- rbinom(nrow(df), 1, df$z * exp(W %*% alpha) / (1 + exp(W %*% alpha)))
+
+  # add visit location
+  tmp <- list()
+  for(i in 1:nrow(df)){
+    tmp[[i]] <- st_sample(df %>% slice(i) %>% st_as_sf(), 1) %>% as_tibble
+  }
+  df <- df %>%
+    select(-geometry) %>%
+    bind_cols(., do.call("bind_rows", tmp))
+  
+  # add detection - negbin
+  # r <- ifelse(is.null(r), abs(rnorm(1, 0, .5)), r)
+  # delta <- rnorm(2)
+  # df2 <- df %>%
+  #   mutate(nreps = k) %>%
+  #   uncount(nreps) %>%
+  #   mutate(rep = rep(1:k, n*j)) %>%
+  #   mutate(v = rnorm(n())) %>%
+  #   select(site, visit, rep, z, a, x, w, v, everything())
+  # 
+  # V <- cbind(rep(1, nrow(df2)), df2$v)
+  # df2$y <- rnbinom(nrow(df2), r, exp(V %*% delta) / (1 + exp(V %*% delta)))
+  # df2$y[which(df2$a == 0)] <- 0
+  
+  # add detection - poisson
+  delta <- rnorm(2, sd = sqrt(delta_var))
+  df2 <- df %>%
+    mutate(nreps = k) %>%
+    uncount(nreps) %>%
+    mutate(rep = rep(1:k, n*j)) %>%
+    mutate(v = rnorm(n())) %>%
+    select(site, visit, rep, z, a, x, w, v, everything())
+  
+  V <- cbind(rep(1, nrow(df2)), df2$v)
+  df2$y <- rpois(nrow(df2), df2$a * exp(V %*% delta))
+  
+  out <- list(
+    df = df2,
+    grid = grid,
+    params = list(
+      beta = beta, alpha = alpha, delta = delta
+    )
+  )
+  
+  return(out)
+}
+sim_dat <- sim_msocc_counts(n = 81, delta_var = 4, seed = 04112022)
+
+sim_dat$df %>%
+  group_by(site, visit) %>%
+  summarize(geometry = geometry, total_count = sum(y)) %>%
+  distinct() %>%
+  st_as_sf() %>%
+  ggplot() +
+  geom_sf(aes(col = total_count), size = 3) +
+  theme_bw() +
+  geom_sf(
+    data = sim_dat$grid %>% 
+      st_as_sf(),
+    aes(fill = factor(z)), alpha = .05
+  ) +
+  scale_color_continuous(type = "viridis", trans = "log") +
+  labs(
+    color = "Log total count"
+  )
+```
+
+### Gibbs sampler
+
+#### Derivations
+
+Below, we derive the Gibbs step for regression coefficients given a negative binomial sampling model. Throughout, we omit subscripts to ease notation. Suppose $y \sim \text{NegBin}(r, p)$, where
+\[
+\begin{split}
+p(y | r, p) &= {y+r-1\choose y}  p^r (1 - p)^y \\
+&\propto p^r (1 - p)^y,
+\end{split}
+\]
+and assume a logit link function $p = \frac{\exp (x\beta)}{1 + \exp (x\beta)}$. Theorem 1 from @polson2013 states that if $\omega \sim PG(b, 0)$, then for all $a \in \mathbb{R}$, 
+\[
+\frac{(e^\psi)^a}{(1 + e^\psi)^b} = 2^{-b}e^{\kappa\psi} \int_{0}^\infty e^{-\omega \psi^2/2} p(\omega) d\omega,
+\]
+where $\kappa = a - b/2$.
+
+We leverage Theorem 1 to construct a Gibbs sampler for negative binomial sampling models by introducing Polya-gamma distributed auxiliary variables, resulting in a conditionally Gaussian kernel for which Gibbs sampling techniques are well defined. First, we manipulate the likelihood.
+\[
+\begin{split}
+p(y | r, p) &= {y+r-1\choose y}  p^r (1 - p)^y \\
+&\propto p^r (1 - p)^y \\
+&= \left(\frac{\exp(x\beta)}{1 + \exp(x\beta)}\right)^r \left(1 - \frac{\exp(x\beta)}{1 + \exp(x\beta)} \right)^y \\
+&= \left(\frac{\exp(x\beta)}{1 + \exp(x\beta)}\right)^r \left(\frac{1}{1 + \exp(x\beta)} \right)^y \\
+&= \frac{(\exp(x\beta))^r}{(1 + \exp(x\beta))^{r+y}} \\
+\end{split}
+\]
+By Theorem 1 from @polson2013,
+\[
+\begin{split}
+\frac{(\exp(x\beta))^r}{(1 + \exp(x\beta))^{r+y}} &= 2^{-(r+y)}e^{\kappa x\beta} \int_{0}^\infty e^{-\omega (x\beta)^2/2} p(\omega) d\omega \\
+&\propto e^{\kappa x\beta} \int_{0}^\infty e^{-\omega (x\beta)^2/2} p(\omega) d\omega
+\end{split}
+\]
+where $\kappa = r - (y + r)/2$. Now, consider the likelihood contribution for a single observation for the regression coefficients $\beta$.
+\[
+\begin{split}
+L_(\beta | y_i) &\propto \frac{(\exp(x_i\beta))^r}{(1 + \exp(x_i\beta))^{r+y_i}} = 2^{-(r+y_i)}e^{\kappa_i x_i\beta} \int_{0}^\infty e^{-\omega_i (x_i\beta)^2/2} p(\omega_i) d\omega_i \\
+&\propto e^{\kappa_i x_i\beta} \int_{0}^\infty e^{-\omega_i (x_i\beta)^2/2} p(\omega_i) d\omega_i
+\end{split}
+\]
+where $\kappa_i = r - (y_i + r)/2$. To obtain our Gibbs step for the regression coefficients, we condition on the Polya-gamma auxiliary variables and consider $n$ observations.
+\[
+\begin{split}
+p(\beta | \omega, y) &\propto p(\beta) \prod_{i=1}^n L_i(\beta | \omega_i, y_i) \\
+&= p(\beta) \prod_{i=1}^n \exp \left\{\kappa_i x_i\beta -\omega_i (x_i\beta)^2/2 \right\}
+\end{split}
+\]
+Refresher on completing the square:
+\[
+\begin{split}
+\exp \left\{\kappa_i x_i\beta - \omega_i \frac{(x_i\beta)^2}{2} \right\} &= \exp \left\{ - \frac{\omega_i}{2} \left((x_i\beta)^2 - \frac{2\kappa_i}{\omega_i} (x_i\beta)\right) \right\} \\
+&= \exp \left\{ - \frac{\omega_i}{2} \left((x_i\beta)^2 - \frac{2\kappa_i}{\omega_i} (x_i\beta) + \frac{\kappa^2_i}{\omega^2_i} - \frac{\kappa^2_i}{\omega^2_i}\right) \right\} \\
+&= \exp \left\{ - \frac{\omega_i}{2} \left(\left(x_i\beta - \frac{\kappa_i}{\omega_i}\right)^2 - \frac{\kappa^2_i}{\omega^2_i}\right) \right\} \\
+&\propto \exp\left\{ - \frac{\omega_i}{2} \left(x_i\beta - \frac{\kappa_i}{\omega_i}\right)^2\right\}
+\end{split}
+\]
+Returning to the full conditional distribution of $\beta$
+\[
+\begin{split}
+p(\beta | \omega, y) &\propto p(\beta) \prod_{i=1}^n L_i(\beta | \omega_i, y_i) \\
+&= p(\beta) \prod_{i=1}^n \exp \left\{\kappa_i x_i\beta -\omega_i (x_i\beta)^2/2 \right\} \\
+&\propto p(\beta) \prod_{i=1}^n \exp\left\{ - \frac{\omega_i}{2} \left(x_i\beta - \frac{\kappa_i}{\omega_i}\right)^2\right\}
+\end{split}\]
+Let $z_i = \frac{\kappa_i}{\omega_i}$. Then $p(\beta | \omega, y) \propto p(\beta) \prod_{i=1}^n \exp\left\{ - \frac{\omega_i}{2} \left(z_i - x_i\beta\right)^2\right\}$, which is the kernel of a $N(x_i\beta, \frac{1}{\omega_i})$ distribution. Combining all $n$ observations into matrix notation, we have
+\[
+p(\beta | \omega, y) \propto p(\beta) \exp \left\{-\frac{1}{2} (z - X\beta)'\Omega (z- X\beta) \right\}
+\]
+where $z = \left(\frac{1}{2\omega_1}(r - y_1), ...,\frac{1}{2\omega_n}(r - y_n) \right)$ and $\Omega = \text{diag}(\omega_1, ..., \omega_n)$. 
+
+This same process is replicated at the first two levels of the occupancy hierarchy, but with binomial sampling models. See @polson2013 for full details. Additionally, full conditional distributions are required for the Polya-gamma auxiliary variables and the dispersion parameter for the negative binomial distribution. The full conditional distribution for the Polya-gamma auxiliary variables is
+\[
+\omega_i | \beta \sim PG(y_i + r, x_i \beta),
+\]
+see @polson2013 for full detail. To sample the dispersion parameter, we implement the method described by @zhou2012.
+
+```{r, eval = F}
+# df = sim_dat$df %>% rename(Site = site, Visit = visit, Rep = rep)
+# occ_mod = ~ x
+# occurence_mod = ~ w
+# detection_mod = ~ v
+# rep = "Rep"
+# site = "Site"
+# visit = "Visit"
+# response = "y"
+# num_mcmc = 5000
+# seed = 1
+# nburnin = num_mcmc/2
+
+options(dplyr.summarise.inform = FALSE)
+fit_msocc_counts <- function(
+  df, occ_mod = ~1, occurence_mod = ~1, detection_mod = ~1,
+  site = "site", visit = "visit", rep = "rep", response = "y",
+  num_mcmc = 5000, seed = 1, nburnin = num_mcmc/2
+){
+  # function to fit occupancy model with gibbs
+  
+  # housekeeping
+  y <- unlist(unname(df[,response]))
+  X <- model.matrix(
+    as.formula(occ_mod), 
+    df[, which(colnames(df) %in% c(site, all.vars(as.formula(occ_mod))))] %>% distinct
+  )
+  W <- model.matrix(
+    as.formula(occurence_mod), 
+    df[, which(colnames(df) %in% c(visit, all.vars(as.formula(occurence_mod))))] %>% distinct
+  )
+  V <- model.matrix(as.formula(detection_mod), df)
+  j.vec <- distinct(df[, which(colnames(df) %in% c(site, visit))]) %>%
+    group_by(.data[[site]]) %>%
+    summarize(tmp = max(.data[[visit]])) %>%
+    ungroup %>% select(tmp) %>% unlist() %>% unname
+  k.vec <- df[, which(colnames(df) %in% c(site, visit))] %>%
+    group_by(.data[[site]], .data[[visit]]) %>%
+    summarize(tmp = n()) %>%
+    ungroup %>% select(tmp) %>% unlist() %>% unname
+  
+  df_backup <- df
+  
+  # storage
+  beta_mcmc <- matrix(0, num_mcmc, ncol(X))
+  alpha_mcmc <- matrix(0, num_mcmc, ncol(W))
+  delta_mcmc <- matrix(0, num_mcmc, ncol(V))
+  r_mcmc <- matrix(0, num_mcmc, 1)
+  z_mcmc <- matrix(0, num_mcmc, nrow(X))
+  a_mcmc <- matrix(0, num_mcmc, nrow(W))
+  
+  # initialize
+  beta <- matrix(rnorm(ncol(X)), ncol(X), 1);beta_mcmc[1,] <- c(beta)
+  Xb <- X %*% beta
+  
+  alpha <- matrix(rnorm(ncol(W)), ncol(W), 1);alpha_mcmc[1,] <- c(alpha)
+  Wa <- W %*% alpha
+  
+  delta <- matrix(rnorm(ncol(V)), ncol(V), 1);delta_mcmc[1,] <- c(delta)
+  Vd <- V %*% delta
+  
+  z <- rbinom(nrow(X), 1, exp(Xb) / (1 + exp(Xb)))
+  a <- rbinom(nrow(W), 1, exp(Wa) / (1 + exp(Wa))) * rep(z, j.vec)
+  
+  r <- .5
+  L <- rep(0, nrow(V))
+  
+  # start mcmc
+  pb <- txtProgressBar(min = 0, max = num_mcmc, style = 3, width = 50, char = "=")
+  for(iter in 2:num_mcmc){
+    # update z
+    psi <- exp(Xb) / (1 + exp(Xb))
+    theta <- exp(Wa) / (1 + exp(Wa))
+    prod <- sapply(split(theta, rep(1:length(j.vec), j.vec)), function(x) prod(1 - x))
+    z_prob <- (psi*prod) / (1 - psi + psi*prod)
+    z_prob[which(sapply(split(a, rep(1:length(j.vec), j.vec)), sum) != 0),] <- 1
+    z <- rbinom(nrow(X), 1, c(z_prob))
+    
+    # update a
+    ## need Pr(y > 0) = 1 - Pr(y = 0) =  1 - (p^r * (1 - p)^y)
+    p <- exp(Vd) / (1 + exp(Vd))
+    pr.detect <- 1 -(p^r * (1 - p)^y)
+    prod <- sapply(split(pr.detect, rep(1:length(k.vec), k.vec)), function(x) prod(1 - x))
+    a_prob <- (rep(z, j.vec)*theta*prod) / (1 - rep(z, j.vec)*theta + rep(z, j.vec)*theta*prod)
+    a_prob[which(sapply(split(y, rep(1:length(k.vec), k.vec)), sum) != 0),] <- 1
+    a <- rbinom(nrow(W), 1, c(a_prob))
+    
+    # update beta
+    ## PG latents 
+    omega.site <- pgdraw::pgdraw(1, c(Xb))
+    
+    ## betas
+    kappa.z <- z - .5
+    Omega.site <- diag(omega.site, nrow = nrow(X), ncol = nrow(X))
+    V.inv <- solve(t(X) %*% Omega.site %*% X + diag(ncol(X)))
+    m <- V.inv %*% (t(X) %*% kappa.z)
+    
+    beta <- matrix(c(mvtnorm::rmvnorm(1, m, V.inv)), ncol = 1)
+    Xb <- X %*% beta
+    
+    # update alpha
+    ## restrict to where z = 1
+    z.ndx <- which(rep(z, j.vec) == 1)
+    W.red <- W[z.ndx, ,drop = F]
+    
+    ## PG latents 
+    omega.visit <- pgdraw::pgdraw(1, c(W.red %*% alpha))
+    
+    ## alphas
+    kappa.a <- a[z.ndx] - .5
+    Omega.visit <- diag(omega.visit, nrow = nrow(W.red), ncol = nrow(W.red))
+    V.inv <- solve(t(W.red) %*% Omega.visit %*% W.red + diag(ncol(W.red)))
+    m <- V.inv %*% (t(W.red) %*% kappa.a)
+    
+    alpha <- matrix(c(mvtnorm::rmvnorm(1, m, V.inv)), ncol = 1)
+    Wa <- W %*% alpha
+    
+    # update delta
+    ## restrict to where a = 1
+    a.ndx <- which(rep(a, k.vec) == 1)
+    V.red <- V[a.ndx, ,drop = F]
+
+    ## PG latents
+    omega.rep <- BayesLogit::rpg(nrow(V.red), y[a.ndx] + r, c(V.red %*% delta))
+
+    ## alphas
+    kappa.y <- (r - y[a.ndx]) / (2)
+    Omega.rep <- diag(omega.rep, nrow = nrow(V.red), ncol = nrow(V.red))
+    V.inv <- solve(t(V.red) %*% Omega.rep %*% V.red + diag(ncol(V.red)))
+    m <- V.inv %*% (t(V.red) %*% kappa.y)
+
+    delta <- matrix(c(mvtnorm::rmvnorm(1, m, V.inv)), ncol = 1)
+    Vd <- V %*% delta
+    V.redd <- V.red %*% delta
+
+    # update h
+    # h <- rgamma(1, .01 + .01, .01 + r)
+    
+    # update L
+    y_tmp <- y[a.ndx]
+    L <- rep(0, length(y_tmp))
+    for(j in 1:length(y_tmp)){
+      L[j] <- sum(rbinom(y_tmp[j], 1, round(r / (r + 1:y_tmp[j] - 1), 6)))
+    }
+    
+    # update r
+    p <- round(exp(V.redd) / (1 + exp(V.redd)), 6)
+    r <- rgamma(1, .01 + sum(L), .01 - sum(log(1-p)))
+
+    # store
+    beta_mcmc[iter,] <- c(beta)
+    alpha_mcmc[iter,] <- c(alpha)
+    delta_mcmc[iter,] <- c(delta)
+    z_mcmc[iter,] <- c(z)
+    a_mcmc[iter,] <- c(a)
+    r_mcmc[iter,] <- r
+    
+    # progress
+    setTxtProgressBar(pb, iter)
+  }
+  close(pb)
+  
+  return(
+    list(
+      beta = beta_mcmc[(nburnin+1):num_mcmc,],
+      alpha = alpha_mcmc[(nburnin+1):num_mcmc,],
+      delta = delta_mcmc[(nburnin+1):num_mcmc,],
+      z = z_mcmc[(nburnin+1):num_mcmc,],
+      a = a_mcmc[(nburnin+1):num_mcmc,],
+      r = r_mcmc[(nburnin+1):num_mcmc,],
+      j.vec = j.vec,
+      k.vec = k.vec
+    )
+  )
+  
+}
+
+# rm(sim_dat)
+occ_fit <- fit_msocc_counts(
+  df = sim_dat$df %>% rename("Site" = site, "Visit" = visit),
+  occ_mod = ~x, occurence_mod = ~w, detection_mod = ~v,
+  site = "Site", visit = "Visit", rep = "rep", response = "y", seed = 04102022,
+  num_mcmc = 5000
+)
+saveRDS(occ_fit, "fit_msocc_counts_test.rds")
+
+sim_dat$params
+colMeans(occ_fit$beta)
+colMeans(occ_fit$alpha)
+colMeans(occ_fit$delta)
+mean(occ_fit$r)
+```
+
+```{r, eval = F}
+sim <- function(nsims){
+  out <- list()
+  for(sim in 1:nsims){
+    # sim data - dont simulate all zeroes lmao
+    all_zero <- TRUE
+    ndx <- 0
+    while(all_zero){
+       sim_dat <- sim_msocc_counts(seed = sim + ndx*100, n = 49)
+       all_zero <- all(sim_dat$df$y == 0)
+       ndx <- ndx + 1
+    }
+    
+    # fit model
+    occ_fit <- fit_msocc_counts(
+      df = sim_dat$df %>% rename("Site" = site, "Visit" = visit),
+      occ_mod = ~x, occurence_mod = ~w, detection_mod = ~v,
+      site = "Site", visit = "Visit", rep = "rep", response = "y", seed = 04102022,
+      num_mcmc = 5000
+    )
+    
+    # summarize
+    out[[sim]] <- tibble(
+      param = rep(c("beta", "alpha", "delta", "r"), c(ncol(occ_fit$beta), ncol(occ_fit$alpha), ncol(occ_fit$delta), 1)),
+      dim = c(1:ncol(occ_fit$beta), 1:ncol(occ_fit$alpha), 1:ncol(occ_fit$delta), 1),
+      mean = c(colMeans(occ_fit$beta), colMeans(occ_fit$alpha),  colMeans(occ_fit$delta), mean(occ_fit$r)),
+      lwr = c(apply(occ_fit$beta, 2, quantile, 0.025), apply(occ_fit$alpha, 2, quantile, 0.025), apply(occ_fit$delta, 2, quantile, 0.025), quantile(occ_fit$r, .025)),
+      upr = c(apply(occ_fit$beta, 2, quantile, 0.975), apply(occ_fit$alpha, 2, quantile, 0.975), apply(occ_fit$delta, 2, quantile, 0.975), quantile(occ_fit$r, .975))
+    ) %>%
+      mutate(sim = sim) %>%
+      mutate(truth = c(sim_dat$params$beta, sim_dat$params$alpha, sim_dat$params$delta, sim_dat$params$r))
+    
+    message(paste0("Sim ", sim, " of ", nsims, " complete."))
+  }
+  
+  return(do.call("bind_rows", out))
+}
+
+msocc_simulation_counts_test <- sim(10)
+saveRDS(msocc_simulation_counts_test, "msocc_simulation_counts_test3.rds")
+```
+
+```{r, eval = F}
+msocc_simulation_counts_test <- readRDS("msocc_simulation_counts_test.rds")
+msocc_simulation_counts_test %>%
+  mutate(
+    capture = case_when(
+      truth >= lwr & truth <= upr ~ 1,
+      TRUE ~ 0
+    ) %>% factor
+  ) %>%
+  mutate(sim = factor(sim)) %>%
+  ggplot() + 
+  geom_linerange(aes(y = sim, x = mean, xmin = lwr, xmax = upr, col = capture)) +
+  geom_point(aes(x = truth, y = sim), pch = "|", size = 4) + 
+  facet_grid(dim ~ param) +
+  theme_bw()
+```
+
+### Probabilistic programming language - NIMBLE
+
+Since we are using a PPL to sample the posterior distribution, conditional conjugacy between the priors and sampling model is not required. Therefore, we replace the bottom level of the hierarchy with a Poisson sampling model for the counts.
+
+\[
+\begin{split}
+z_i &\sim \text{Bernoulli}(\psi_i), \hspace{5mm} \text{logit}(\psi_i) = x_i'\beta, \\
+a_{ij} &\sim \text{Bernoulli}(z_i \theta_{ij}), \hspace{5mm} \text{logit}(\theta_{ij}) = w_{ij}' \alpha \\
+y_{ijk} &\sim \text{Poisson}(a_{ij} \lambda_{ijk}), \hspace{5mm} \text{log}(\lambda_{ijk}) = v_{ijk}' \delta
+\end{split}
+\]
+
+```{r, eval = F}
+# format data
+site_df <- sim_dat$df %>%
+  select(site, x) %>% 
+  distinct
+
+sample_df <- sim_dat$df %>%
+  select(site, visit, w) %>%
+  distinct()
+
+X = model.matrix(~ x, site_df)
+W = model.matrix(~ w, sample_df)
+V = model.matrix(~ v, sim_dat$df)
+
+# function to fit model
+fit_model <- function(seed = 1, code, data, constants, inits, niter, nchains, thin = 1, nburnin = 0){
+  library(nimble)
+  
+  # R model
+  model <- nimbleModel(code, constants, data)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  model_conf <- configureMCMC(model)
+  model_conf$addMonitors(c("beta", "alpha", "delta"))
+  
+  # R mcmc
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc, project = model_c)
+  
+  # run model
+  out <- runMCMC(
+    mcmc_c, 
+    niter = niter, 
+    nchains = nchains, 
+    thin = thin, 
+    init = inits,
+    setSeed = seed,
+    nburnin = nburnin
+  )
+  
+  # out
+  return(out)
+}
+
+# nimble code
+code <- nimbleCode({
+  # priors
+  for(i in 1:p_beta){
+    beta[i] ~ dnorm(0, var = 2)
+  }
+  for(i in 1:p_alpha){
+    alpha[i] ~ dnorm(0, var = 2)
+  }
+  for(i in 1:p_delta){
+    delta[i] ~ dnorm(0, var = 10)
+  }
+  
+  # likelihood - site level occupancy
+  for(site in 1:nsites){
+    logit(psi[site]) <- (beta[1:p_beta] %*% X[site, 1:p_beta])[1,1]
+    z[site] ~ dbern(psi[site])
+  }
+  
+  # likelihood - sample level availability
+  for(sample in 1:nsamples){
+    logit(theta[sample]) <- (alpha[1:p_alpha] %*% W[sample, 1:p_alpha])[1,1]
+    a[sample] ~ dbern(z[site.vec[sample]] * theta[sample])
+  }
+  
+  # likelihood - replicate level detection
+  for(rep in 1:nreps){
+    log(lambda[rep]) <-  (delta[1:p_delta] %*% V[rep, 1:p_delta])[1,1]
+    y[rep] ~ dpois(a[sample.vec[rep]] * lambda[rep])
+  }
+})
+
+# init function
+init_func <- function(){
+  out <- list(
+    beta = rnorm(2),
+    theta = rnorm(2),
+    delta = rnorm(1),
+    a = matrix(sample(c(0, 1), size = 49*4, replace = T), 49*4, 1),
+    z = matrix(sample(c(0, 1), size = 49, replace = T), 49, 1)
+  )
+}
+
+Sys.time()
+library(parallel)
+this_cluster <- makeCluster(3)
+fit <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = fit_model,
+  code = code,
+  data = list(
+    # response
+    y = sim_dat$df$y,
+
+    # covariates
+    X = X,
+    W = W,
+    V = V
+  ),
+  constants = list(
+    p_beta = ncol(X),
+    p_alpha = ncol(W),
+    p_delta = ncol(V),
+    nsites = nrow(X),
+    nsamples = nrow(W),
+    nreps = nrow(V),
+    site.vec = sample_df$site,
+    sample.vec = sim_dat$df %>% group_by(site, visit) %>% mutate(ndx = cur_group_id()) %>% ungroup %>% select(ndx) %>% unlist %>% unname
+  ),
+  niter = 50000,
+  nchains = 1,
+  thin = 1,
+  nburnin = 0,
+  inits = init_func
+)
+stopCluster(this_cluster)
+Sys.time()
+
+saveRDS(fit, file = "msocc_count_fit_nimble.rds")
+
+# summarize
+nchains <- length(fit)
+niter <- nrow(fit[[1]])
+tmp <- do.call("rbind", fit)
+plot_tbl <- tibble(
+  trace = c(tmp),
+  param = rep(colnames(tmp), each = nchains*niter),
+  chain = factor(rep(rep(1:nchains, each = niter), ncol(tmp))),
+  iteration = rep(rep(1:niter, nchains), ncol(tmp))
+)
+
+plot_tbl %>%
+  filter(iteration > 25000) %>%
+  ggplot() +
+  geom_line(aes(x = iteration, y = trace, col = chain)) +
+  facet_wrap(~ param) +
+  theme_bw()
+
+plot_tbl %>% 
+  filter(iteration > 25000) %>%
+  group_by(param) %>%
+  summarize(mean = mean(trace))
+sim_dat$params
+```
+
+```{r, eval = F}
+nimble_summary <- function(fit, warmup = nrow(fit[[1]])/2, thin = 1){
+  # convert to coda for normal summary
+  fit_warmup <- lapply(fit, function(x) x[(warmup+1):nrow(x),])
+  coda_samples <- as.mcmc.list(lapply(fit_warmup, function(x) as.mcmc(
+    x, start = warmup+1, end = nrow(fit), thin = thin
+  )))
+  
+  sum <- summary(coda_samples)
+  params <- dimnames(sum$statistics)[[1]]
+  tmp_sum <- cbind(sum$statistics, sum$quantiles)
+  
+  # get r hat / n_eff
+  mat <- matrix(NA, nrow = nrow(tmp_sum), ncol = 3)
+  colnames(mat) <- c("Rhat", "ess_bulk", "ess_tail")
+  for(i in 1:nrow(tmp_sum)){
+    tmp <- sapply(fit, function(x) x[,i])
+    mat[i,] <- c(Rhat(tmp), ess_bulk(tmp), ess_tail(tmp))
+  }
+  
+  # out 
+  out <- cbind(tmp_sum, mat)
+  return(out)
+}
+sim <- function(nsims){
+  out <- list()
+  for(sim in 1:nsims){
+    # sim data - dont simulate all zeroes lmao
+    # all_zero <- TRUE
+    # ndx <- 0
+    # while(all_zero){
+    #    sim_dat <- sim_msocc_counts(seed = sim + ndx*100, n = 49)
+    #    all_zero <- all(sim_dat$df$y == 0)
+    #    ndx <- ndx + 1
+    # }
+    
+    sim_dat <- sim_msocc_counts(seed = sim, n = 81, delta_var = 4)
+    
+    # fit model
+    # format data
+    site_df <- sim_dat$df %>%
+      select(site, x) %>% 
+      distinct
+    
+    sample_df <- sim_dat$df %>%
+      select(site, visit, w) %>%
+      distinct()
+    
+    X = model.matrix(~ x, site_df)
+    W = model.matrix(~ w, sample_df)
+    V = model.matrix(~ v, sim_dat$df)
+    
+    # nimble code
+    code <- nimbleCode({
+      # priors
+      for(i in 1:p_beta){
+        beta[i] ~ dnorm(0, var = 2)
+      }
+      for(i in 1:p_alpha){
+        alpha[i] ~ dnorm(0, var = 2)
+      }
+      for(i in 1:p_delta){
+        delta[i] ~ dnorm(0, var = 10)
+      }
+      
+      # likelihood - site level occupancy
+      for(site in 1:nsites){
+        logit(psi[site]) <- (beta[1:p_beta] %*% X[site, 1:p_beta])[1,1]
+        z[site] ~ dbern(psi[site])
+      }
+      
+      # likelihood - sample level availability
+      for(sample in 1:nsamples){
+        logit(theta[sample]) <- (alpha[1:p_alpha] %*% W[sample, 1:p_alpha])[1,1]
+        a[sample] ~ dbern(z[site.vec[sample]] * theta[sample])
+      }
+      
+      # likelihood - replicate level detection
+      for(rep in 1:nreps){
+        log(lambda[rep]) <-  (delta[1:p_delta] %*% V[rep, 1:p_delta])[1,1]
+        y[rep] ~ dpois(a[sample.vec[rep]] * lambda[rep])
+      }
+    })
+    
+    # init function
+    init_func <- function(){
+      out <- list(
+        beta = rnorm(2),
+        theta = rnorm(2),
+        delta = rnorm(1),
+        a = matrix(sample(c(0, 1), size = 49*4, replace = T), 81*4, 1),
+        z = matrix(sample(c(0, 1), size = 49, replace = T), 81, 1)
+      )
+    }
+    
+    library(parallel)
+    this_cluster <- makeCluster(3)
+    fit <- parLapply(
+      cl = this_cluster,
+      X = 1:3,
+      fun = fit_model,
+      code = code,
+      data = list(
+        # response
+        y = sim_dat$df$y,
+        
+        # covariates
+        X = X,
+        W = W,
+        V = V
+      ),
+      constants = list(
+        p_beta = ncol(X),
+        p_alpha = ncol(W),
+        p_delta = ncol(V),
+        nsites = nrow(X),
+        nsamples = nrow(W),
+        nreps = nrow(V),
+        site.vec = sample_df$site,
+        sample.vec = sim_dat$df %>% group_by(site, visit) %>% mutate(ndx = cur_group_id()) %>% ungroup %>% select(ndx) %>% unlist %>% unname
+      ),
+      niter = 50000,
+      nchains = 1,
+      thin = 1,
+      nburnin = 0,
+      inits = init_func
+    )
+    stopCluster(this_cluster)
+
+    # summarize
+    sum <- nimble_summary(fit)
+    out[[sim]] <- tibble(
+      param = rownames(sum),
+      mean = sum[,1],
+      lwr = sum[,5],
+      upr = sum[,9],
+      sim = sim,
+      rhat = sum[,10],
+      truth = c(
+        sim_dat$params$alpha, sim_dat$params$beta, sim_dat$params$delta
+      )
+    )
+    
+    message(paste0("Sim ", sim, " of ", nsims, " complete."))
+  }
+  
+  return(do.call("bind_rows", out))
+}
+
+msocc_simulation_counts <- sim(100)
+saveRDS(msocc_simulation_counts, "msocc_simulation_counts.rds")
+```
+
+```{r, eval = T}
+msocc_simulation_counts <- readRDS("msocc_simulation_counts.rds")
+msocc_simulation_counts %>%
+  mutate(
+    capture = case_when(
+      truth >= lwr & truth <= upr ~ 1,
+      TRUE ~ 0
+    ) %>% factor
+  ) %>%
+  mutate(sim = factor(sim)) %>%
+  mutate(param = factor(param, levels = c("alpha[1]", "beta[1]", "delta[1]", "alpha[2]", "beta[2]", "delta[2]"))) %>%
+  ggplot() + 
+  geom_linerange(aes(y = sim, x = mean, xmin = lwr, xmax = upr, col = capture)) +
+  geom_point(aes(x = truth, y = sim), pch = "|", size = 4) + 
+  facet_wrap(~ param, nrow = 2) +
+  theme_bw()
+```
+
+# Integrated count occupancy
+
+## Continuous disease prevalence surface
+
+We extend the three-stage count occupancy model to accommodate point-referenced disease surveillance data. 
+
+\[
+\begin{split}
+z_i &\sim \text{Bernoulli}(\psi_i), \hspace{5mm} \text{logit}(\psi_i) = x_i'\beta, \\
+a_{ij} &\sim \text{Bernoulli}(z_i \theta_{ij}), \hspace{5mm} \text{logit}(\theta_{ij}) = w_{ij}' \alpha \\
+y_{ijk} &\sim \text{Poisson}(a_{ij} \lambda_{ijk}), \hspace{5mm} \text{log}(\lambda_{ijk}) = v_{ijk}' \delta + \eta^{*}_{ij}\gamma
+\end{split}
+\]
+where $p_{ij}$ represents the disease prevalence and
+\[
+\begin{split}
+\text{logit}(p_{ij}) &= \eta_{ij} \\
+\eta &\sim \mathcal{N}\left(0, \Sigma\right)
+\end{split}
+\]
+where $\Sigma_{ij} = \sigma^2\exp\left\{ -\frac{d_{ij}}{\phi}  \right\}$ and $d_{ij}$ represents the distance between sample locations $i$ and $j$.
+
+### Simulated data
+
+```{r, eval = T}
+# n = 100
+# j = 4
+# k = 8
+# seed = 04182022
+# delta_var = 1
+# gamma_var = 1
+# sigma2 = .25
+# phi2 = 100
+
+sim_msocc_counts_disease <- function(n = 100, j = 4, k = 8, seed = 1, delta_var = 1, gamma_var = 4, sigma2 = 1, phi2 = 1){
+  # function to simulated occupancy on a square grid
+  
+  # useful functions
+  rmvnorm.rcpp <- cxxfunction(
+    sig = signature(n_ = "integer", mu_ = "numeric", sigma_ = "matrix"),
+    body = "
+    using namespace Rcpp;
+    int n = as<int>(n_);
+    arma::vec mu = as<arma::vec>(mu_);
+    arma::mat sigma = as<arma::mat>(sigma_);
+    int ncols = sigma.n_cols;
+    arma::mat Y = arma::randn(n, ncols);
+    return wrap(arma::repmat(mu, 1, n).t() + Y * arma::chol(sigma));
+    ",
+    plugin = "RcppArmadillo",
+    verbose = FALSE
+  )
+  
+  distance <- function(x){
+    dist.vec <- parallelDist::parDist(x)
+    dist <- as.matrix(dist.vec)
+    return(dist)
+  }
+  
+  # dexpcov <- nimbleFunction(
+  #   run = function(dists = double(2), rho = double(0), sigma = double(0)) {
+  #     returnType(double(2))
+  #     n <- dim(dists)[1]
+  #     result <- matrix(nrow = n, ncol = n, init = FALSE)
+  #     sigma2 <- sigma*sigma
+  #     rho2 <- rho * rho
+  #     for(i in 1:n)
+  #       for(j in 1:n)
+  #         result[i, j] <- sigma2 * exp((-1/2) * (1/rho2) * dists[i,j] * dists[i,j])
+  #     return(result)
+  #   }
+  # )
+  # c.dexpcov <- compileNimble(dexpcov)
+  
+  expcov <- nimbleFunction(
+    run = function(dists = double(2), rho = double(0), sigma = double(0)) {
+      returnType(double(2))
+      n <- dim(dists)[1]
+      result <- matrix(nrow = n, ncol = n, init = FALSE)
+      sigma2 <- sigma*sigma
+      for(i in 1:n)
+        for(j in 1:n)
+          result[i, j] <- sigma2*exp(-dists[i,j]/rho)
+      return(result)
+    }
+    
+  )
+  c.expcov <- compileNimble(expcov)
+  
+  
+  # housekeeping
+  if((sqrt(n) %% 1) != 0) stop("n should be a perfect square")
+  set.seed(seed)
+  
+  # create grid
+  sfc <- st_sfc(st_polygon(list(rbind(c(0,0), c(sqrt(n),0), c(sqrt(n),sqrt(n)), c(0,0)))))
+  grid <- st_as_sf(st_make_grid(sfc, cellsize = 1, square = TRUE)) %>% as_tibble
+  names(grid) <- "geometry"
+  rm(sfc)
+  
+  # create occupancy covariates
+  grid$x <- rnorm(n)
+  X <- cbind(rep(1, n), grid$x)
+  
+  # generate occupancy
+  beta <- rnorm(2)
+  grid$z <- rbinom(n, 1, prob = exp(X %*% beta) / (1 + exp(X %*% beta)))
+  
+  # add availability
+  alpha <- rnorm(2)
+  df <- grid %>%
+    mutate(site = 1:n()) %>%
+    mutate(nsamples = j) %>%
+    uncount(nsamples) %>%
+    mutate(visit = rep(1:j, n)) %>%
+    mutate(w = rnorm(n())) 
+  W <- cbind(rep(1, nrow(df)), df$w)
+  df$a <- rbinom(nrow(df), 1, df$z * exp(W %*% alpha) / (1 + exp(W %*% alpha)))
+
+  # add visit location
+  tmp <- list()
+  for(i in 1:nrow(df)){
+    tmp[[i]] <- st_sample(df %>% slice(i) %>% st_as_sf(), 1) %>% as_tibble
+  }
+  df <- df %>%
+    select(-geometry) %>%
+    bind_cols(., do.call("bind_rows", tmp))
+  
+  # create pd spread latent surface
+  df_pd <- grid %>% as_tibble %>% mutate(grid_row = 1:n()) %>% sample_frac(.5)
+  df_pd <- df_pd %>%
+    mutate(count = 2) %>%
+    uncount(count) %>% 
+    mutate(swab = rep(1:2, n * .5))
+  
+  # add swab location
+  tmp <- list()
+  for(i in 1:nrow(df_pd)){
+    tmp[[i]] <- st_sample(df_pd %>% slice(i) %>% st_as_sf(), 1) %>% as_tibble
+  }
+  df_pd <- df_pd %>%
+    select(-geometry) %>%
+    bind_cols(., do.call("bind_rows", tmp))
+  
+  # determine GP surface
+  df_total <- bind_rows(
+    df_pd %>% mutate(df = "df_pd"),
+    df %>% mutate(df = "df")
+  )
+  
+  dist_mat <- df_total %>%
+    st_as_sf %>% 
+    st_coordinates() %>%
+    distance(.)
+  # dist_mat <- dist_mat / max(dist_mat)
+  Sigma <- c.expcov(dist_mat, rho = sqrt(phi2), sqrt(sigma2))
+  df_total$eta <- c(rmvnorm.rcpp(1, rep(0, nrow(df_total)), Sigma))
+  df_total$present <- factor(rbinom(nrow(df_total), 1, exp(df_total$eta) / (1 + exp(df_total$eta))))
+  
+  # clean up
+  df_pd <- df_total %>%
+    filter(df == "df_pd") %>%
+    select_if(~sum(!is.na(.)) > 0)
+  df <- df_total %>%
+    filter(df == "df") %>%
+    select_if(~sum(!is.na(.)) > 0)
+  
+  # add detection - poisson
+  delta <- rnorm(2, sd = sqrt(delta_var))
+  gamma <- rnorm(1, sd = sqrt(gamma_var))
+  df2 <- df %>%
+    mutate(nreps = k) %>%
+    uncount(nreps) %>%
+    mutate(rep = rep(1:k, n*j)) %>%
+    mutate(v = rnorm(n())) %>%
+    select(site, visit, rep, z, a, x, w, v, everything())
+  
+  V <- cbind(rep(1, nrow(df2)), df2$v)
+  df2$y <- rpois(nrow(df2), df2$a * exp(V %*% delta +  gamma*df2$eta))
+  
+  out <- list(
+    df = df2,
+    grid = grid,
+    df_pd = df_pd,
+    df_total = df_total,
+    params = list(
+      beta = beta, alpha = alpha, delta = delta, gamma = gamma
+    )
+  )
+  
+  return(out)
+}
+
+sim_dat <- sim_msocc_counts_disease(
+  n = 100,
+  j = 4,
+  k = 8,
+  seed = 04212022,
+  delta_var = 1,
+  gamma_var = 1,
+  sigma2 = 1,
+  phi2 = 25
+)
+
+ggplot() + 
+  geom_sf(
+    data = sim_dat$grid %>% 
+      st_as_sf(),
+    aes(fill = factor(z)), alpha = .05
+  ) +
+  geom_sf(
+    data = sim_dat$df_pd %>%
+      st_as_sf(),
+    aes(col = present),
+    pch = 2
+  ) +
+  new_scale_color() +
+  geom_sf(
+    data = sim_dat$df %>%
+      st_as_sf(), 
+    aes(col = y)
+  ) + 
+  scale_color_continuous(type = "viridis", trans = "log") +
+  labs(
+    color = "Log total count"
+  ) +
+  theme_bw()
+```
+
+### Probabilistic programming language
+
+TRY SCALING DISTANCE
+
+
+https://peterroelants.github.io/posts/gaussian-process-tutorial/#:~:text=The%20posterior%20predictions%20of%20a,the%20covariance%20and%20mean%20functions.
+
+```{r, eval = F}
+# functions
+distance <- function(x){
+  dist.vec <- parallelDist::parDist(x)
+  dist <- as.matrix(dist.vec)
+  return(dist)
+}
+
+expcov <- nimbleFunction(
+  run = function(dists = double(2), rho = double(0), sigma = double(0)) {
+    returnType(double(2))
+    n <- dim(dists)[1]
+    result <- matrix(nrow = n, ncol = n, init = FALSE)
+    sigma2 <- sigma*sigma
+    for(i in 1:n)
+      for(j in 1:n)
+        result[i, j] <- sigma2*exp(-dists[i,j]/rho)
+    return(result)
+  }
+  
+)
+c.expcov <- compileNimble(expcov)
+
+# format data
+site_df <- sim_dat$df %>%
+  select(site, x) %>% 
+  distinct
+
+sample_df <- sim_dat$df %>%
+  select(site, visit, w) %>%
+  distinct()
+
+X = model.matrix(~ x, site_df)
+W = model.matrix(~ w, sample_df)
+V = model.matrix(~ v, sim_dat$df)
+
+# function to fit model
+fit_model <- function(seed = 1, code, data, constants, inits, niter, nchains, thin = 1, nburnin = 0){
+  library(nimble)
+  
+  # R model
+  model <- nimbleModel(code, constants, data)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  model_conf <- configureMCMC(model)
+  model_conf$addMonitors(c("beta", "alpha", "delta", "eta_11"))
+  
+  # R mcmc
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc, project = model_c)
+  
+  # run model
+  out <- runMCMC(
+    mcmc_c, 
+    niter = niter, 
+    nchains = nchains, 
+    thin = thin, 
+    init = inits,
+    setSeed = seed,
+    nburnin = nburnin
+  )
+  
+  # out
+  return(out)
+}
+
+# nimble code
+code <- nimbleCode({
+  # priors
+  for(i in 1:p_beta){
+    beta[i] ~ dnorm(0, var = 2)
+  }
+  for(i in 1:p_alpha){
+    alpha[i] ~ dnorm(0, var = 2)
+  }
+  for(i in 1:p_delta){
+    delta[i] ~ dnorm(0, var = 10)
+  }
+  # gamma ~ dnorm(0, var = 10)
+  phi ~ dunif(0, max_dist)
+  sigma ~ dgamma(.01, rate = .01)
+  
+  # likelihood - site level occupancy
+  for(site in 1:nsites){
+    logit(psi[site]) <- (beta[1:p_beta] %*% X[site, 1:p_beta])[1,1]
+    z[site] ~ dbern(psi[site])
+  }
+  
+  # likelihood - sample level availability
+  for(sample in 1:nsamples){
+    logit(theta[sample]) <- (alpha[1:p_alpha] %*% W[sample, 1:p_alpha])[1,1]
+    a[sample] ~ dbern(z[site.vec[sample]] * theta[sample])
+  }
+  
+  # likelihood - replicate level detection
+  for(rep in 1:nreps){
+    log(lambda[rep]) <- (delta[1:p_delta] %*% V[rep, 1:p_delta])[1,1]
+    y[rep] ~ dpois(a[sample.vec[rep]] * lambda[rep])
+  }
+  
+  # disease
+  Sigma_11[1:nswabs, 1:nswabs] <- expcov(
+    dists = dist_11[1:nswabs, 1:nswabs],
+    rho = phi,
+    sigma = sigma
+  )
+  eta_11[1:nsites] ~ dmnorm(zeroes_11[1:nsites], cov = Sigma_11[1:nswabs, 1:nswabs])
+  for(swab in 1:nswabs){
+    logit(p[swab]) <- eta_11[swap]
+    disease[swab] ~ dbern(p[swab])
+  }
+  
+})
+
+# init function
+# init_func <- function(){
+#   out <- list(
+#     beta = rnorm(2),
+#     theta = rnorm(2),
+#     delta = rnorm(1),
+#     a = matrix(sample(c(0, 1), size = 49*4, replace = T), 49*4, 1),
+#     z = matrix(sample(c(0, 1), size = 49, replace = T), 49, 1),
+#     eta_11
+#   )
+# }
+
+Sys.time()
+library(parallel)
+this_cluster <- makeCluster(3)
+fit <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = fit_model,
+  code = code,
+  data = list(
+    # response
+    y = sim_dat$df$y,
+
+    # covariates
+    X = X,
+    W = W,
+    V = V,
+    
+    # disease
+    disease = sim_dat$df_pd$present %>% as.character %>% as.numeric
+  ),
+  constants = list(
+    p_beta = ncol(X),
+    p_alpha = ncol(W),
+    p_delta = ncol(V),
+    nsites = nrow(X),
+    nsamples = nrow(W),
+    nreps = nrow(V),
+    site.vec = sample_df$site,
+    sample.vec = sim_dat$df %>% group_by(site, visit) %>% mutate(ndx = cur_group_id()) %>% ungroup %>% select(ndx) %>% unlist %>% unname,
+    
+    # disease and prediction
+    max_dist = 20,
+    nswabs = nrow(sim_dat$df_pd),
+    dist_11 = sim_dat$df_pd %>%
+      st_as_sf %>%
+      st_coordinates %>%
+      distance(.),
+    zeroes_11 = rep(0, nrow(sim_dat$df_pd))
+  ),
+  niter = 50000,
+  nchains = 1,
+  thin = 1,
+  nburnin = 0
+  # inits = init_func
+)
+stopCluster(this_cluster)
+Sys.time()
+
+saveRDS(fit, file = "msocc_count_fit_nimble.rds")
+
+```
+
+```{r}
+# in series - for now
+distance <- function(x){
+  dist.vec <- parallelDist::parDist(x)
+  dist <- as.matrix(dist.vec)
+  return(dist)
+}
+
+expcov <- nimbleFunction(
+  run = function(dists = double(2), rho = double(0), sigma = double(0)) {
+    returnType(double(2))
+    n <- dim(dists)[1]
+    result <- matrix(nrow = n, ncol = n, init = FALSE)
+    sigma2 <- sigma*sigma
+    for(i in 1:n)
+      for(j in 1:n)
+        result[i, j] <- sigma2*exp(-dists[i,j]/rho)
+    return(result)
+  }
+  
+)
+cexpcov <- compileNimble(expcov)
+
+# format data
+site_df <- sim_dat$df %>%
+  select(site, x) %>% 
+  distinct
+
+sample_df <- sim_dat$df %>%
+  select(site, visit, w) %>%
+  distinct()
+
+X = model.matrix(~ x, site_df)
+W = model.matrix(~ w, sample_df)
+V = model.matrix(~ v, sim_dat$df)
+
+code = nimbleCode({
+  # priors
+  for(i in 1:p_beta){
+    beta[i] ~ dnorm(0, var = 2)
+  }
+  for(i in 1:p_alpha){
+    alpha[i] ~ dnorm(0, var = 2)
+  }
+  for(i in 1:p_delta){
+    delta[i] ~ dnorm(0, var = 10)
+  }
+  # gamma ~ dnorm(0, var = 10)
+  phi ~ dunif(0, max_dist)
+  sigma ~ dunif(.10, 2)
+  
+  # likelihood - site level occupancy
+  for(site in 1:nsites){
+    logit(psi[site]) <- (beta[1:p_beta] %*% X[site, 1:p_beta])[1,1]
+    z[site] ~ dbern(psi[site])
+  }
+  
+  # likelihood - sample level availability
+  for(sample in 1:nsamples){
+    logit(theta[sample]) <- (alpha[1:p_alpha] %*% W[sample, 1:p_alpha])[1,1]
+    a[sample] ~ dbern(z[site.vec[sample]] * theta[sample])
+  }
+  
+  # likelihood - replicate level detection
+  for(rep in 1:nreps){
+    log(lambda[rep]) <- (delta[1:p_delta] %*% V[rep, 1:p_delta])[1,1]
+    y[rep] ~ dpois(a[sample.vec[rep]] * lambda[rep])
+  }
+  
+  # disease
+  Sigma_11[1:nswabs, 1:nswabs] <- expcov(
+    dists = dist_11[1:nswabs, 1:nswabs],
+    rho = phi,
+    sigma = sigma
+  )
+  eta_11[1:nswabs] ~ dmnorm(zeroes_11[1:nswabs], cov = Sigma_11[1:nswabs, 1:nswabs])
+  for(swab in 1:nswabs){
+    logit(p[swab]) <- eta_11[swab]
+    disease[swab] ~ dbern(p[swab])
+  }
+  
+})
+data = list(
+  # response
+  y = sim_dat$df$y,
+  
+  # covariates
+  X = X,
+  W = W,
+  V = V,
+  
+  # disease
+  disease = sim_dat$df_pd$present %>% as.character %>% as.numeric
+)
+constants = list(
+  p_beta = ncol(X),
+  p_alpha = ncol(W),
+  p_delta = ncol(V),
+  nsites = nrow(X),
+  nsamples = nrow(W),
+  nreps = nrow(V),
+  site.vec = sample_df$site,
+  sample.vec = sim_dat$df %>% group_by(site, visit) %>% mutate(ndx = cur_group_id()) %>% ungroup %>% select(ndx) %>% unlist %>% unname,
+  
+  # disease and prediction
+  max_dist = 20,
+  nswabs = nrow(sim_dat$df_pd),
+  dist_11 = sim_dat$df_pd %>%
+    st_as_sf %>%
+    st_coordinates %>%
+    distance(.),
+  zeroes_11 = rep(0, nrow(sim_dat$df_pd))
+)
+inits <- list(
+  beta = rnorm(2),
+  alpha = rnorm(2),
+  delta = rnorm(1),
+  a = c(matrix(sample(c(0, 1), size = 100*4, replace = T), 100*4, 1)),
+  z = c(matrix(sample(c(0, 1), size = 10, replace = T), 100, 1)),
+  phi = 5,
+  sigma = 1
+)
+inits$Sigma_11 <- cexpcov(dists = constants$dist_11, rho = inits$phi, sigma = inits$sigma)
+inits$eta_11 <- t(chol(inits$Sigma_11)) %*% rnorm( nrow(sim_dat$df_pd))
+inits$eta_11 <- inits$eta_11[,1]
+
+# fit model
+model <- nimbleModel(code = code, constants = constants, data = data, inits = inits)
+cModel <- compileNimble(model)
+conf <- configureMCMC(model)
+conf$addMonitors('eta_11')
+# conf$printSamplers()
+# conf$removeSamplers('eta_11[1:100]')
+# ## reduce the initial proposal covariance scale for better mixing
+# conf$addSampler('eta_11[1:100]', 'RW_block', control = list(scale = 0.1))
+MCMC <- buildMCMC(conf)
+cMCMC <- compileNimble(MCMC, project = cModel)
+samples <- runMCMC(cMCMC, niter = 50000, nburnin = 0, nchains = 3)
+```
+
+```{r, eval = F}
+# summarize
+fit <- samples
+
+nchains <- length(fit)
+niter <- nrow(fit[[1]])
+tmp <- do.call("rbind", fit)
+plot_tbl <- tibble(
+  trace = c(tmp),
+  param = rep(colnames(tmp), each = nchains*niter),
+  chain = factor(rep(rep(1:nchains, each = niter), ncol(tmp))),
+  iteration = rep(rep(1:niter, nchains), ncol(tmp))
+)
+
+extract_obs <- function(x) {
+  str_extract_all(x, "(?<=\\[)[^\\]\\[]*?[^\\]\\[]*(?=])")[[1]]
+}
+
+plot_tbl %>% 
+  filter(iteration >= 25000) %>%
+  group_by(param) %>%
+  summarize(mean = mean(trace), lwr = quantile(trace, .025), upr = quantile(trace, .975)) %>%
+  filter(grepl("eta_11", param)) %>%
+  mutate(
+    obs = sapply(param, extract_obs) %>% as.numeric
+  ) %>%
+  arrange(obs) %>% 
+  mutate(truth = sim_dat$df_pd$eta) %>%
+  mutate(
+    capture = case_when(
+      truth >= lwr & truth <= upr ~ 1,
+      TRUE ~ 0
+    ) %>% factor
+  ) %>%
+  ggplot() + 
+  geom_linerange(aes(y = param, x = mean, xmin = lwr, xmax = upr, col = capture)) +
+  geom_point(aes(x = truth, y = param), pch = "|", size = 4) +
+  theme_bw()
+  
+
+plot_tbl %>%
+  filter(param == "eta_11[1]") %>%
+  ggplot() + 
+  geom_line(aes(x = iteration, y = trace, col = chain))
+
+
+tmp <- nimble_summary(fit)
+```
+
+```{r, eval = F}
+nimble_summary <- function(fit, warmup = nrow(fit[[1]])/2, thin = 1){
+  # convert to coda for normal summary
+  fit_warmup <- lapply(fit, function(x) x[(warmup+1):nrow(x),])
+  coda_samples <- as.mcmc.list(lapply(fit_warmup, function(x) as.mcmc(
+    x, start = warmup+1, end = nrow(fit), thin = thin
+  )))
+  
+  sum <- summary(coda_samples)
+  params <- dimnames(sum$statistics)[[1]]
+  tmp_sum <- cbind(sum$statistics, sum$quantiles)
+  
+  # get r hat / n_eff
+  mat <- matrix(NA, nrow = nrow(tmp_sum), ncol = 3)
+  colnames(mat) <- c("Rhat", "ess_bulk", "ess_tail")
+  for(i in 1:nrow(tmp_sum)){
+    tmp <- sapply(fit, function(x) x[,i])
+    mat[i,] <- c(Rhat(tmp), ess_bulk(tmp), ess_tail(tmp))
+  }
+  
+  # out 
+  out <- cbind(tmp_sum, mat)
+  return(out)
+}
+sim <- function(nsims){
+  out <- list()
+  for(sim in 1:nsims){
+    # sim data - dont simulate all zeroes lmao
+    # all_zero <- TRUE
+    # ndx <- 0
+    # while(all_zero){
+    #    sim_dat <- sim_msocc_counts(seed = sim + ndx*100, n = 49)
+    #    all_zero <- all(sim_dat$df$y == 0)
+    #    ndx <- ndx + 1
+    # }
+    
+    sim_dat <- sim_msocc_counts(seed = sim, n = 81, delta_var = 4)
+    
+    # fit model
+    # format data
+    site_df <- sim_dat$df %>%
+      select(site, x) %>% 
+      distinct
+    
+    sample_df <- sim_dat$df %>%
+      select(site, visit, w) %>%
+      distinct()
+    
+    X = model.matrix(~ x, site_df)
+    W = model.matrix(~ w, sample_df)
+    V = model.matrix(~ v, sim_dat$df)
+    
+    # nimble code
+    code <- nimbleCode({
+      # priors
+      for(i in 1:p_beta){
+        beta[i] ~ dnorm(0, var = 2)
+      }
+      for(i in 1:p_alpha){
+        alpha[i] ~ dnorm(0, var = 2)
+      }
+      for(i in 1:p_delta){
+        delta[i] ~ dnorm(0, var = 10)
+      }
+      
+      # likelihood - site level occupancy
+      for(site in 1:nsites){
+        logit(psi[site]) <- (beta[1:p_beta] %*% X[site, 1:p_beta])[1,1]
+        z[site] ~ dbern(psi[site])
+      }
+      
+      # likelihood - sample level availability
+      for(sample in 1:nsamples){
+        logit(theta[sample]) <- (alpha[1:p_alpha] %*% W[sample, 1:p_alpha])[1,1]
+        a[sample] ~ dbern(z[site.vec[sample]] * theta[sample])
+      }
+      
+      # likelihood - replicate level detection
+      for(rep in 1:nreps){
+        log(lambda[rep]) <-  (delta[1:p_delta] %*% V[rep, 1:p_delta])[1,1]
+        y[rep] ~ dpois(a[sample.vec[rep]] * lambda[rep])
+      }
+    })
+    
+    # init function
+    init_func <- function(){
+      out <- list(
+        beta = rnorm(2),
+        theta = rnorm(2),
+        delta = rnorm(1),
+        a = matrix(sample(c(0, 1), size = 49*4, replace = T), 81*4, 1),
+        z = matrix(sample(c(0, 1), size = 49, replace = T), 81, 1)
+      )
+    }
+    
+    library(parallel)
+    this_cluster <- makeCluster(3)
+    fit <- parLapply(
+      cl = this_cluster,
+      X = 1:3,
+      fun = fit_model,
+      code = code,
+      data = list(
+        # response
+        y = sim_dat$df$y,
+        
+        # covariates
+        X = X,
+        W = W,
+        V = V
+      ),
+      constants = list(
+        p_beta = ncol(X),
+        p_alpha = ncol(W),
+        p_delta = ncol(V),
+        nsites = nrow(X),
+        nsamples = nrow(W),
+        nreps = nrow(V),
+        site.vec = sample_df$site,
+        sample.vec = sim_dat$df %>% group_by(site, visit) %>% mutate(ndx = cur_group_id()) %>% ungroup %>% select(ndx) %>% unlist %>% unname
+      ),
+      niter = 50000,
+      nchains = 1,
+      thin = 1,
+      nburnin = 0,
+      inits = init_func
+    )
+    stopCluster(this_cluster)
+
+    # summarize
+    sum <- nimble_summary(fit)
+    out[[sim]] <- tibble(
+      param = rownames(sum),
+      mean = sum[,1],
+      lwr = sum[,5],
+      upr = sum[,9],
+      sim = sim,
+      rhat = sum[,10],
+      truth = c(
+        sim_dat$params$alpha, sim_dat$params$beta, sim_dat$params$delta
+      )
+    )
+    
+    message(paste0("Sim ", sim, " of ", nsims, " complete."))
+  }
+  
+  return(do.call("bind_rows", out))
+}
+
+msocc_simulation_counts <- sim(100)
+saveRDS(msocc_simulation_counts, "msocc_simulation_counts.rds")
+```
+
+```{r, eval = T}
+msocc_simulation_counts <- readRDS("msocc_simulation_counts.rds")
+msocc_simulation_counts %>%
+  mutate(
+    capture = case_when(
+      truth >= lwr & truth <= upr ~ 1,
+      TRUE ~ 0
+    ) %>% factor
+  ) %>%
+  mutate(sim = factor(sim)) %>%
+  mutate(param = factor(param, levels = c("alpha[1]", "beta[1]", "delta[1]", "alpha[2]", "beta[2]", "delta[2]"))) %>%
+  ggplot() + 
+  geom_linerange(aes(y = sim, x = mean, xmin = lwr, xmax = upr, col = capture)) +
+  geom_point(aes(x = truth, y = sim), pch = "|", size = 4) + 
+  facet_wrap(~ param, nrow = 2) +
+  theme_bw()
+```
+
+\newpage
+# References
+
+
