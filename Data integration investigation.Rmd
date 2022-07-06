@@ -486,11 +486,11 @@ sim_ols <- function(nsims, n = 400){
   return(do.call("bind_rows", sum_tbl))
 }
 ols_sims <- sim_ols(100, 400)
-saveRDS(ols_sims, "ols_sims.rds")
+saveRDS(ols_sims, "rds files/ols_sims.rds")
 ```
 
 ```{r}
-ols_sims <- readRDS("ols_sims.rds")
+ols_sims <- readRDS("rds files/ols_sims.rds")
 ols_sims %>%
   mutate(
     capture = factor(case_when(
@@ -717,11 +717,11 @@ sim_gls <- function(nsims, n = 400){
   return(do.call("bind_rows", sum_tbl))
 }
 gls_sims <- sim_gls(100, 400)
-saveRDS(gls_sims, "gls_sims.rds")
+saveRDS(gls_sims, "rds files/gls_sims.rds")
 ```
 
 ```{r}
-gls_sims <- readRDS("gls_sims.rds")
+gls_sims <- readRDS("rds files/gls_sims.rds")
 gls_sims %>%
   mutate(
     capture = factor(case_when(
@@ -1010,7 +1010,7 @@ samples <- parLapply(
 )
 stopCluster(this_cluster)
 
-saveRDS(samples, "gibbs_gp.rds")
+saveRDS(samples, "rds files/gibbs_gp.rds")
 ```
 
 ```{r, echo = T}
@@ -1121,7 +1121,7 @@ samples <- parLapply(
 )
 stopCluster(this_cluster)
 
-saveRDS(samples, "gibbs_gp2.rds")
+saveRDS(samples, "rds files/gibbs_gp2.rds")
 ```
 
 ```{r, echo = T}
@@ -1237,11 +1237,11 @@ gp_sim <- function(nsims, n = 100){
   return(do.call("bind_rows", sum_tbl))
 }
 gp_sims <- gp_sim(100, 100)
-saveRDS(gp_sims, "gp_sims_1_3.rds")
+saveRDS(gp_sims, "rds files/gp_sims_1_3.rds")
 ```
 
 ```{r}
-gp_sims <- readRDS("gp_sims_1_3.rds")
+gp_sims <- readRDS("rds files/gp_sims_1_3.rds")
 gp_sims %>%
   mutate(
     capture = factor(case_when(
@@ -1649,7 +1649,7 @@ occ_fit <- fit_msocc_counts(
   site = "Site", visit = "Visit", rep = "rep", response = "y", seed = 04102022,
   num_mcmc = 5000
 )
-saveRDS(occ_fit, "fit_msocc_counts_test.rds")
+saveRDS(occ_fit, "rds files/fit_msocc_counts_test.rds")
 
 sim_dat$params
 colMeans(occ_fit$beta)
@@ -1697,11 +1697,11 @@ sim <- function(nsims){
 }
 
 msocc_simulation_counts_test <- sim(10)
-saveRDS(msocc_simulation_counts_test, "msocc_simulation_counts_test3.rds")
+saveRDS(msocc_simulation_counts_test, "rds files/msocc_simulation_counts_test3.rds")
 ```
 
 ```{r, eval = F}
-msocc_simulation_counts_test <- readRDS("msocc_simulation_counts_test.rds")
+msocc_simulation_counts_test <- readRDS("rds files/msocc_simulation_counts_test.rds")
 msocc_simulation_counts_test %>%
   mutate(
     capture = case_when(
@@ -1857,7 +1857,7 @@ fit <- parLapply(
 stopCluster(this_cluster)
 Sys.time()
 
-saveRDS(fit, file = "msocc_count_fit_nimble.rds")
+saveRDS(fit, file = "rds files/msocc_count_fit_nimble.rds")
 
 # summarize
 nchains <- length(fit)
@@ -2034,11 +2034,11 @@ sim <- function(nsims){
 }
 
 msocc_simulation_counts <- sim(100)
-saveRDS(msocc_simulation_counts, "msocc_simulation_counts.rds")
+saveRDS(msocc_simulation_counts, "rds files/msocc_simulation_counts.rds")
 ```
 
 ```{r, eval = T}
-msocc_simulation_counts <- readRDS("msocc_simulation_counts.rds")
+msocc_simulation_counts <- readRDS("rds files/msocc_simulation_counts.rds")
 msocc_simulation_counts %>%
   mutate(
     capture = case_when(
@@ -2470,7 +2470,7 @@ fit <- parLapply(
 stopCluster(this_cluster)
 Sys.time()
 
-saveRDS(fit, file = "msocc_count_fit_nimble.rds")
+saveRDS(fit, file = "rds files/msocc_count_fit_nimble.rds")
 
 ```
 
@@ -2813,11 +2813,11 @@ sim <- function(nsims){
 }
 
 msocc_simulation_counts <- sim(100)
-saveRDS(msocc_simulation_counts, "msocc_simulation_counts.rds")
+saveRDS(msocc_simulation_counts, "rds files/msocc_simulation_counts.rds")
 ```
 
 ```{r, eval = T}
-msocc_simulation_counts <- readRDS("msocc_simulation_counts.rds")
+msocc_simulation_counts <- readRDS("rds files/msocc_simulation_counts.rds")
 msocc_simulation_counts %>%
   mutate(
     capture = case_when(
