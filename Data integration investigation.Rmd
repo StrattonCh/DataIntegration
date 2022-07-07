@@ -1010,10 +1010,11 @@ samples <- parLapply(
 )
 stopCluster(this_cluster)
 
-saveRDS(samples, "rds files/gibbs_gp.rds")
+# saveRDS(samples, "rds files/gibbs_gp.rds")
 ```
 
 ```{r, echo = T}
+samples <- readRDS("rds files/gibbs_gp.rds")
 colMeans(samples[[1]]$accept_ratio)
 nimble_summary(list(samples[[1]]$samples, samples[[2]]$samples, samples[[3]]$samples), warmup = 0)
 
@@ -1121,10 +1122,11 @@ samples <- parLapply(
 )
 stopCluster(this_cluster)
 
-saveRDS(samples, "rds files/gibbs_gp2.rds")
+# saveRDS(samples, "rds files/gibbs_gp2.rds")
 ```
 
 ```{r, echo = T}
+samples <- readRDS("rds files/gibbs_gp2.rds")
 colMeans(samples[[1]]$accept_ratio)
 nimble_summary(list(samples[[1]]$samples, samples[[2]]$samples, samples[[3]]$samples), warmup = 0)
 
@@ -1152,7 +1154,7 @@ lines(samples[[3]][[1]][,3], type = "l", col = 3)
 
 ### Stan
 
-```{r}
+```{r, eval = F}
 fit <- stan(
   file = "stan programs/gp.stan",
   data = list(
@@ -1171,7 +1173,7 @@ fit <- stan(
 saveRDS(fit, "stan fits/gp2.rds")
 ```
 
-```{r}
+```{r, eval = F}
 fit2 <- readRDS("stan fits/gp2.rds")
 summary(fit2)$summary
 ```
@@ -1257,25 +1259,9 @@ gp_sims %>%
   theme_bw()
 ```
 
+## Prediction - test
 
-
-## Prediction
-
-__Spatial process__
-\[
-\begin{split}
-\boldsymbol{y} &\sim \mathcal{N}(X\boldsymbol{\beta}, \boldsymbol{\Sigma}), \hspace{5mm}
-\boldsymbol{\Sigma} &= \sigma^2 \exp\left(-\frac{d_{ij}^2}{2\phi^2}\right)
-\end{split}
-\]
-
-__Observation process__
-\[
-\begin{split}
-\boldsymbol{\eta} &\sim \mathcal{N}(X\boldsymbol{\beta}, \boldsymbol{\Sigma}), \hspace{5mm}
-\boldsymbol{\Sigma} &= \sigma^2 \exp\left(-\frac{d_{ij}^2}{2\phi^2}\right)
-\end{split}
-\]
+### One dataset
 
 ```{r}
 # n = 100
@@ -1317,12 +1303,13 @@ sim_gp_predict <- function(n = 100, seed = 1, sigma = 1, phi = 1, X = matrix(1, 
     as.matrix %>%
     distance
   
-  # dist_mat <- dist_mat / max(dist_mat) # normalize max dist to 1
-  
   Sigma <- sigma^2 * exp(-dist_mat^2 / (2*phi^2)) + diag(delta, dim(dist_mat))
   grid$y <- c(mvtnorm::rmvnorm(1, X %*% beta, Sigma))
   grid$obs_ind <- factor(rbinom(n, size = 1, prob = 1 - pred_prop))
   # grid$y <- c(chol(Sigma) %*% rnorm(n) + X %*% beta) 
+  
+  grid <- grid %>%
+    arrange(desc(obs_ind))
     
   # reorder spatial random effects
   dist_mat <- grid %>%
@@ -1333,8 +1320,7 @@ sim_gp_predict <- function(n = 100, seed = 1, sigma = 1, phi = 1, X = matrix(1, 
     distance
   
   out <- list(
-    df = grid %>%
-      arrange(desc(obs_ind)),
+    df = grid,
     params = list(
       phi = phi, sigma = sigma, phi = phi, beta = beta
     ),
@@ -1366,20 +1352,20 @@ gridExtra::grid.arrange(p1, p2, nrow = 1)
 ```
 
 ```{r}
-num_mcmc = 10000
-warmup = 5000
-y = data$df %>% filter(obs_ind == 1) %>% select(y) %>% unlist %>% unname
-X_ = cbind(
-  rep(1, sum(data$df$obs_ind == 1))
-)
-dist = data$dist_mat
-phi_a = 4
-phi_b = 11.2
-sigma_a = 1
-sigma_b = 1
-initial_prop_var = .05^2
-adapt = FALSE
-delta = 1e-09
+# num_mcmc = 10000
+# warmup = 5000
+# y = data$df %>% filter(obs_ind == 1) %>% select(y) %>% unlist %>% unname
+# X_ = cbind(
+#   rep(1, sum(data$df$obs_ind == 1))
+# )
+# dist = data$dist_mat
+# phi_a = 4
+# phi_b = 11.2
+# sigma_a = 1
+# sigma_b = 1
+# initial_prop_var = .05^2
+# adapt = FALSE
+# delta = 1e-09
 
 gp_mhgibbs_predict <- function(
     seed, num_mcmc, warmup = num_mcmc/2, y, X_, dist, 
@@ -1481,23 +1467,27 @@ gp_mhgibbs_predict <- function(
     }
     
     # predict
-    Sigma11_inv <- sigma^2 * Omega_inv
-    Sigma12 <- sigma^2 * exp(-dist12^2 / (2*phi2))
-    Sigma22 <- sigma^2 * exp(-dist22^2 / (2*phi2))
-    
-    Sigma2.1 <- round(Sigma22 - t(Sigma11_inv %*% Sigma12) %*% Sigma12, 6)
-    mu2.1 <- t(Sigma11_inv %*% Sigma12) %*% (matrix(c(y), ncol = 1) - Xb)
-    
-    z <- mvtnorm::rmvnorm(1, mu2.1, Sigma2.1)
-    
-    z <- chol(Sigma2.1 + diag(delta, dim(Sigma2.1))) %*% rnorm(N-n) + mu2.1
+    if(iter > warmup){
+      Sigma11_inv <- sigma^2 * Omega_inv
+      Sigma12 <- sigma^2 * exp(-dist12^2 / (2*phi2))
+      Sigma22 <- sigma^2 * exp(-dist22^2 / (2*phi2))
+
+      t.Sigma11_inv.Sigma12 <- t(Sigma11_inv %*% Sigma12)
+      Sigma2.1 <- Sigma22 - t.Sigma11_inv.Sigma12 %*% Sigma12
+      Sigma2.1[lower.tri(Sigma2.1)] = t(Sigma2.1)[lower.tri(Sigma2.1)]
+      mu2.1 <- t.Sigma11_inv.Sigma12 %*% (matrix(c(y), ncol = 1) - Xb)
+
+      z <- mvtnorm::rmvnorm(1, mu2.1, Sigma2.1)
+      z_mcmc[iter,] <- z
+    }
+
+    # z <- chol(Sigma2.1 + diag(delta, dim(Sigma2.1))) %*% rnorm(N-n) + mu2.1
     
     # storage
     beta_mcmc[iter,] <- beta
     sigma_mcmc[iter,] <- sigma
     phi_mcmc[iter,] <- phi
-    z_mcmc[iter,] <- z
-    
+
     # progress
     setTxtProgressBar(pb, iter)
   }
@@ -1544,14 +1534,149 @@ samples <- parLapply(
   phi_b = 11.2,
   sigma_a = 1,
   sigma_b = 1,
-  initial_prop_var = .05^2,
-  adapt = FALSE,
+  initial_prop_var = .075^2,
+  adapt = TRUE,
   delta = 1e-06
 )
 stopCluster(this_cluster)
 
-saveRDS(samples, "rds files/gibbs_gp_predict.rds")
+# saveRDS(samples, "rds files/gibbs_gp_predict.rds")
 ```
+
+```{r}
+samples <- readRDS("rds files/gibbs_gp_predict.rds")
+colMeans(samples[[1]]$accept_ratio)
+nimble_summary(list(samples[[1]]$samples, samples[[2]]$samples, samples[[3]]$samples), warmup = 0)
+
+plot(samples[[1]][[1]][,2], type = "l")
+lines(samples[[2]][[1]][,2], type = "l", col = 2)
+lines(samples[[3]][[1]][,2], type = "l", col = 3)
+
+plot(samples[[1]][[1]][,3], type = "l")
+lines(samples[[2]][[1]][,3], type = "l", col = 2)
+lines(samples[[3]][[1]][,3], type = "l", col = 3)
+```
+
+### Simulation with synthetic data
+
+```{r, eval = F}
+library(parallel)
+gp_sim_predict <- function(nsims, n = 100){
+  sum_tbl <- list()
+  pb <- txtProgressBar(min = 0, max = nsims, style = 3, width = 50, char = "=")
+  for(sim in 1:nsims){
+    # simulate data
+    sim_dat <- sim_gp_predict(
+      n = n, 
+      sigma = 1, 
+      phi = 3, 
+      seed = sim,
+      delta = 1e-9
+    )
+    
+    # fit model - parallel
+    tmp_sim <- sim
+    this_cluster <- makeCluster(3)
+    samples <- parLapply(
+      cl = this_cluster,
+      X = 1:3,
+      fun = gp_mhgibbs_predict,
+      num_mcmc = 15000,
+      warmup = 10000,
+      y = sim_dat$df %>% filter(obs_ind == 1) %>% select(y) %>% unlist %>% unname, 
+      X_ = cbind(
+        rep(1, sum(sim_dat$df$obs_ind == 1))
+      ),
+      dist = sim_dat$dist_mat,
+      phi_a = 4,
+      phi_b = 11.2,
+      sigma_a = 1,
+      sigma_b = 1,
+      initial_prop_var = .075^2,
+      adapt = TRUE,
+      delta = 1e-06
+    )
+    stopCluster(this_cluster)
+    
+    sum <- nimble_summary(list(samples[[1]]$samples, samples[[2]]$samples, samples[[3]]$samples), warmup = 0)
+    sum_tbl[[sim]] <- tibble(
+      param = rownames(sum),
+      truth = c(0, 1, 3, sim_dat$df %>% filter(obs_ind == 0) %>% select(y) %>% unlist %>% unname),
+      mean = sum[,1],
+      lwr = sum[,5],
+      upr = sum[,9],
+      rhat = sum[,10],
+      ess_bulk = sum[,11],
+      ess_tail = sum[,12]
+    ) %>%
+      mutate(sim = tmp_sim)
+    
+    setTxtProgressBar(pb, sim)
+  }
+  close(pb)
+  
+  return(do.call("bind_rows", sum_tbl))
+}
+gp_sims_predict <- gp_sim_predict(100, 100)
+saveRDS(gp_sims_predict, "rds files/gp_sims_predict_1_3.rds")
+```
+
+```{r}
+gp_sims <- readRDS("rds files/gp_sims_predict_1_3.rds")
+gp_sims %>%
+  filter(!grepl("z[[]", param)) %>%
+  mutate(
+    capture = factor(case_when(
+      truth >= lwr & truth <= upr ~ 1, 
+      TRUE ~ 0
+    ))
+  ) %>%
+  ggplot() + 
+  geom_linerange(
+    aes(xmin = lwr, xmax = upr, x = mean, col = capture, y = sim)
+  ) +
+  facet_wrap(~ param, scales = "free_x") +
+  theme_bw()
+
+gp_sims %>%
+  filter(grepl("z[[]", param)) %>%
+  mutate(
+    capture = factor(case_when(
+      truth >= lwr & truth <= upr ~ 1, 
+      TRUE ~ 0
+    ))
+  ) %>%
+  ggplot() + 
+  geom_linerange(
+    aes(xmin = lwr, xmax = upr, x = mean, col = capture, y = sim)
+  ) +
+  facet_wrap(~ param, scales = "free_x") +
+  theme_bw()
+```
+
+
+
+
+
+## Prediction - latent process
+
+__Spatial process__
+\[
+\begin{split}
+\boldsymbol{y} &\sim \mathcal{N}(X\boldsymbol{\beta}, \boldsymbol{\Sigma}), \hspace{5mm}
+\boldsymbol{\Sigma} &= \sigma^2 \exp\left(-\frac{d_{ij}^2}{2\phi^2}\right)
+\end{split}
+\]
+
+__Observation process__
+\[
+\begin{split}
+\boldsymbol{\eta} &\sim \mathcal{N}(X\boldsymbol{\beta}, \boldsymbol{\Sigma}), \hspace{5mm}
+\boldsymbol{\Sigma} &= \sigma^2 \exp\left(-\frac{d_{ij}^2}{2\phi^2}\right)
+\end{split}
+\]
+
+
 
 # Count occupancy models
 
