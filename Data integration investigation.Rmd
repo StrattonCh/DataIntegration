@@ -1411,7 +1411,7 @@ gp_mhgibbs_predict <- function(
   
   # priors
   mu0 <- matrix(0, nrow = p, ncol = 1)
-  Sigma0 <- 100 * diag(1, p, p)
+  Sigma0 <- 10 * diag(1, p, p)
   Sigma0_inv <- solve(Sigma0)
   prior_prod <- Sigma0_inv %*% mu0
   a0 <- sigma_a
@@ -1485,8 +1485,10 @@ gp_mhgibbs_predict <- function(
     Sigma12 <- sigma^2 * exp(-dist12^2 / (2*phi2))
     Sigma22 <- sigma^2 * exp(-dist22^2 / (2*phi2))
     
-    Sigma2.1 <- Sigma22 - t(Sigma11_inv %*% Sigma12) %*% Sigma12
+    Sigma2.1 <- round(Sigma22 - t(Sigma11_inv %*% Sigma12) %*% Sigma12, 6)
     mu2.1 <- t(Sigma11_inv %*% Sigma12) %*% (matrix(c(y), ncol = 1) - Xb)
+    
+    z <- mvtnorm::rmvnorm(1, mu2.1, Sigma2.1)
     
     z <- chol(Sigma2.1 + diag(delta, dim(Sigma2.1))) %*% rnorm(N-n) + mu2.1
     
