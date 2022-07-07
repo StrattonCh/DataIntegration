@@ -1655,9 +1655,6 @@ gp_sims %>%
 ```
 
 
-
-
-
 ## Prediction - latent process
 
 __Spatial process__
@@ -1671,12 +1668,11 @@ __Spatial process__
 __Observation process__
 \[
 \begin{split}
-\boldsymbol{\eta} &\sim \mathcal{N}(X\boldsymbol{\beta}, \boldsymbol{\Sigma}), \hspace{5mm}
-\boldsymbol{\Sigma} &= \sigma^2 \exp\left(-\frac{d_{ij}^2}{2\phi^2}\right)
+\eta_i &\sim N(x'_i \bolsymbol{\beta} + z\alpha, 1) \\
+\boldsymbol{z} &\sim \mathcal{N}(\mu_{2|1}, \Sigma_{2_1})
 \end{split}
 \]
-
-
+where $\Sigma_{2|1} = \Sigma_{22} - (\Sigma_{11}^{-1}\Sigma_{12})' \Sigma_{12}$ and $\mu_{2|1} = (\Sigma_{11}^{-1}\Sigma_{12})' (y - \mu_{11})$
 
 # Count occupancy models
 
