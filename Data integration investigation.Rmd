@@ -1261,12 +1261,295 @@ gp_sims %>%
 
 ## Prediction
 
+__Spatial process__
 \[
 \begin{split}
 \boldsymbol{y} &\sim \mathcal{N}(X\boldsymbol{\beta}, \boldsymbol{\Sigma}), \hspace{5mm}
 \boldsymbol{\Sigma} &= \sigma^2 \exp\left(-\frac{d_{ij}^2}{2\phi^2}\right)
 \end{split}
 \]
+
+__Observation process__
+\[
+\begin{split}
+\boldsymbol{\eta} &\sim \mathcal{N}(X\boldsymbol{\beta}, \boldsymbol{\Sigma}), \hspace{5mm}
+\boldsymbol{\Sigma} &= \sigma^2 \exp\left(-\frac{d_{ij}^2}{2\phi^2}\right)
+\end{split}
+\]
+
+```{r}
+# n = 100
+# seed = 1
+# sigma = 1
+# phi = 1
+# X = matrix(1, nrow = n)
+# beta = 0
+# delta = 1e-9
+# pred_pro = .4
+
+sim_gp_predict <- function(n = 100, seed = 1, sigma = 1, phi = 1, X = matrix(1, nrow = n), beta = 0, delta = 1e-9, pred_prop = .4){
+  # function to simulated occupancy on a square grid
+  
+  # useful functions
+  distance <- function(x){
+    dist.vec <- parallelDist::parDist(x)
+    dist <- as.matrix(dist.vec)
+    return(dist)
+  }
+
+  # housekeeping
+  if((sqrt(n) %% 1) != 0) stop("n should be a perfect square")
+  set.seed(seed)
+  
+  # create grid
+  sfc <- st_sfc(st_polygon(list(rbind(c(0,0), c(sqrt(n),0), c(sqrt(n),sqrt(n)), c(0,0)))))
+  grid <- st_as_sf(st_make_grid(sfc, cellsize = 1, square = TRUE)) %>% as_tibble
+  names(grid) <- "geometry"
+  rm(sfc)
+  
+  # spatial random effects
+  coords <- grid %>%
+    st_as_sf %>%
+    st_centroid %>%
+    st_coordinates
+  
+  dist_mat <- coords %>%
+    as.matrix %>%
+    distance
+  
+  # dist_mat <- dist_mat / max(dist_mat) # normalize max dist to 1
+  
+  Sigma <- sigma^2 * exp(-dist_mat^2 / (2*phi^2)) + diag(delta, dim(dist_mat))
+  grid$y <- c(mvtnorm::rmvnorm(1, X %*% beta, Sigma))
+  grid$obs_ind <- factor(rbinom(n, size = 1, prob = 1 - pred_prop))
+  # grid$y <- c(chol(Sigma) %*% rnorm(n) + X %*% beta) 
+    
+  # reorder spatial random effects
+  dist_mat <- grid %>%
+    st_as_sf %>%
+    st_centroid %>%
+    st_coordinates %>%
+    as.matrix %>%
+    distance
+  
+  out <- list(
+    df = grid %>%
+      arrange(desc(obs_ind)),
+    params = list(
+      phi = phi, sigma = sigma, phi = phi, beta = beta
+    ),
+    dist_mat = dist_mat,
+    coords = coords
+  )
+  
+  return(out)
+}
+data <- sim_gp_predict(n = 10^2, sigma = 1, phi = 3, seed = 06302022, delta = 1e-9)
+
+
+p1 <- data$df %>%
+  st_as_sf %>%
+  ggplot() +
+  geom_sf(aes(fill = y)) +
+  theme_bw() +
+  labs(title = "Population")
+
+p2 <- data$df %>%
+  st_as_sf %>%
+  filter(obs_ind == 1) %>%
+  ggplot() +
+  geom_sf(aes(fill = y)) +
+  theme_bw() +
+  labs(title = "Observed data")
+
+gridExtra::grid.arrange(p1, p2, nrow = 1)
+```
+
+```{r}
+num_mcmc = 10000
+warmup = 5000
+y = data$df %>% filter(obs_ind == 1) %>% select(y) %>% unlist %>% unname
+X_ = cbind(
+  rep(1, sum(data$df$obs_ind == 1))
+)
+dist = data$dist_mat
+phi_a = 4
+phi_b = 11.2
+sigma_a = 1
+sigma_b = 1
+initial_prop_var = .05^2
+adapt = FALSE
+delta = 1e-09
+
+gp_mhgibbs_predict <- function(
+    seed, num_mcmc, warmup = num_mcmc/2, y, X_, dist, 
+    phi_a = .1, phi_b = .1, sigma_a = .1, sigma_b = .1,
+    delta = .0001, 
+    initial_prop_var = .01, adapt = TRUE, adapt_period = .1*num_mcmc, sd = 2.4^2, epsilon = 1e-9){
+  # hoff text pg 189 for reassurance on posteriors
+  # heikki haario (2001) - An adaptive Metropolis algorithm
+  
+  # seed
+  set.seed(seed)
+  
+  # convenience
+  N <- dim(dist)[1]
+  n <- nrow(X_)
+  p <- ncol(X_)
+  
+  # sort distances
+  dist11 <- dist[1:n, 1:n]
+  dist12 <- dist[1:n, (n+1):N]
+  dist22 <- dist[(n+1):N, (n+1):N]
+  
+  # storage
+  sigma_mcmc <- matrix(NA, num_mcmc, 1)
+  phi_mcmc <- matrix(NA, num_mcmc, 1)
+  accept_ratio <- matrix(0, num_mcmc, 1)
+  beta_mcmc <- matrix(NA, num_mcmc, p)
+  z_mcmc <- matrix(NA, num_mcmc, N - n)
+  
+  # priors
+  mu0 <- matrix(0, nrow = p, ncol = 1)
+  Sigma0 <- 100 * diag(1, p, p)
+  Sigma0_inv <- solve(Sigma0)
+  prior_prod <- Sigma0_inv %*% mu0
+  a0 <- sigma_a
+  b0 <- sigma_b
+  
+  # initialize
+  beta <- chol(Sigma0) %*% rnorm(p) + mu0; beta_mcmc[1,] <- beta
+  sigma <- invgamma::rinvgamma(1, a0, b0); sigma_mcmc[1,] <- sigma
+  sigma2 <- sigma^2
+  phi <- invgamma::rinvgamma(1, phi_a, phi_b); phi_mcmc[1,] <- phi
+  phi2 <- phi^2
+  Omega <- exp(-dist11^2/(2*phi2)) + diag(delta, n, n)
+  Omega_inv <- solve(Omega)
+
+  XtOX <- t(X_) %*% Omega_inv %*% X_
+  XtOy <- t(X_) %*% Omega_inv %*% y
+  
+  # adaptive
+  Ct <- initial_prop_var
+  
+  # sampler
+  message(paste0("Beginning sampling at "), Sys.time())
+  pb <- txtProgressBar(min = 0, max = num_mcmc, style = 3, width = 50, char = "=")
+  for(iter in 2:num_mcmc){
+    # beta
+    V <- solve(1/sigma2 * XtOX + Sigma0_inv) + diag(delta, p, p)
+    m <- V %*% (1/sigma2 * XtOy + prior_prod)
+    
+    beta <- chol(V) %*% rnorm(p) + m
+    Xb <- X_ %*% beta
+    
+    # sigma
+    a <- a0 + n/2
+    b <- c(b0 + .5 * t(y - Xb) %*% Omega_inv %*% (y - Xb))
+    sigma <- sqrt(invgamma::rinvgamma(1, a, b))
+    sigma2 <- sigma^2
+    
+    # phi - metropolis
+    ## adaptive
+    if(adapt){
+      if(iter <= adapt_period){
+        Ct <- initial_prop_var
+      } else if(iter > adapt_period){
+        Ct <- sd * cov(phi_mcmc[1:(iter-1),,drop = F]) + sd * epsilon
+      }
+    }
+    
+    ## proposal
+    phi_s <- -1
+    while(phi_s <= 0) phi_s <- phi + rnorm(1, 0, sqrt(Ct))
+    phi2_s <- phi_s^2
+    Omega_s <- exp(-dist11^2/(2*phi2_s)) + diag(delta, n, n)
+
+    ## evaluate proposal
+    log_post_current <- mvtnorm::dmvnorm(y, Xb, sigma2 * Omega, log = T) + invgamma::dinvgamma(phi, phi_a, phi_b, log = T)
+    log_post_s <- mvtnorm::dmvnorm(y, Xb, sigma2 * Omega_s, log = T) + invgamma::dinvgamma(phi_s, phi_a, phi_b, log = T)
+    log_r <- log_post_s - log_post_current
+    if(log(runif(1)) < log_r){
+      phi <- phi_s
+      phi2 <- phi_s^2
+      Omega <- exp(-dist11^2/(2*phi2)) + diag(delta, n, n)
+      Omega_inv <- solve(Omega)
+      XtOX <- t(X_) %*% Omega_inv %*% X_
+      XtOy <- t(X_) %*% Omega_inv %*% y
+
+      accept_ratio[iter,] <- 1
+    }
+    
+    # predict
+    Sigma11_inv <- sigma^2 * Omega_inv
+    Sigma12 <- sigma^2 * exp(-dist12^2 / (2*phi2))
+    Sigma22 <- sigma^2 * exp(-dist22^2 / (2*phi2))
+    
+    Sigma2.1 <- Sigma22 - t(Sigma11_inv %*% Sigma12) %*% Sigma12
+    mu2.1 <- t(Sigma11_inv %*% Sigma12) %*% (matrix(c(y), ncol = 1) - Xb)
+    
+    z <- chol(Sigma2.1 + diag(delta, dim(Sigma2.1))) %*% rnorm(N-n) + mu2.1
+    
+    # storage
+    beta_mcmc[iter,] <- beta
+    sigma_mcmc[iter,] <- sigma
+    phi_mcmc[iter,] <- phi
+    z_mcmc[iter,] <- z
+    
+    # progress
+    setTxtProgressBar(pb, iter)
+  }
+  close(pb)
+  message(paste0("Ending sampling at "), Sys.time())
+  
+  samples <- cbind(
+    beta_mcmc[(warmup+1):num_mcmc,],
+    sigma_mcmc[(warmup+1):num_mcmc,],
+    phi_mcmc[(warmup+1):num_mcmc,],
+    z_mcmc[(warmup+1):num_mcmc,]
+  )
+  
+  colnames(samples) <- c(
+    paste0(rep("beta[", p), 1:p, rep("]", p)), 
+    "sigma", 
+    "phi",
+    paste0(rep("z[", N-n), 1:(N-n), rep("]", N-n))
+  )
+  
+  return(
+    list(
+      samples = samples,
+      accept_ratio = accept_ratio
+    )
+  )
+  
+}
+
+# parallel
+this_cluster <- makeCluster(3)
+samples <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = gp_mhgibbs_predict,
+  num_mcmc = 10000,
+  warmup = 5000,
+  y = data$df %>% filter(obs_ind == 1) %>% select(y) %>% unlist %>% unname, 
+  X_ = cbind(
+    rep(1, sum(data$df$obs_ind == 1))
+  ),
+  dist = data$dist_mat,
+  phi_a = 4,
+  phi_b = 11.2,
+  sigma_a = 1,
+  sigma_b = 1,
+  initial_prop_var = .05^2,
+  adapt = FALSE,
+  delta = 1e-06
+)
+stopCluster(this_cluster)
+
+saveRDS(samples, "rds files/gibbs_gp_predict.rds")
+```
 
 # Count occupancy models
 
