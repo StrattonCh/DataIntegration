@@ -1668,7 +1668,7 @@ __Spatial process__
 __Observation process__
 \[
 \begin{split}
-\eta_i &\sim N(x'_i \bolsymbol{\beta} + z\alpha, 1) \\
+\eta_i &\sim N(x'_i \boldsymbol{\beta} + z\alpha, 1) \\
 \boldsymbol{z} &\sim \mathcal{N}(\mu_{2|1}, \Sigma_{2_1})
 \end{split}
 \]
