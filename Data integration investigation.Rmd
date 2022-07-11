@@ -1468,7 +1468,7 @@ gp_mhgibbs_predict <- function(
     
     # predict
     if(iter > warmup){
-      Sigma11_inv <- sigma^2 * Omega_inv
+      Sigma11_inv <- (1/sigma^2) * Omega_inv
       Sigma12 <- sigma^2 * exp(-dist12^2 / (2*phi2))
       Sigma22 <- sigma^2 * exp(-dist22^2 / (2*phi2))
 
@@ -1715,7 +1715,7 @@ gp_sims %>%
 __Spatial process__
 \[
 \begin{split}
-\boldsymbol{y} &\sim \mathcal{N}(X\boldsymbol{\beta}, \boldsymbol{\Sigma}), \hspace{5mm}
+\boldsymbol{z} &\sim \mathcal{N}(\mu, \boldsymbol{\Sigma}), \hspace{5mm}
 \boldsymbol{\Sigma} &= \sigma^2 \exp\left(-\frac{d_{ij}^2}{2\phi^2}\right)
 \end{split}
 \]
@@ -1723,11 +1723,423 @@ __Spatial process__
 __Observation process__
 \[
 \begin{split}
-\eta_i &\sim N(x'_i \boldsymbol{\beta} + z\alpha, 1) \\
-\boldsymbol{z} &\sim \mathcal{N}(\mu_{2|1}, \Sigma_{2_1})
+y_i &\sim N(x'_i \boldsymbol{\beta} + z^*_i\alpha, 1) \\
+\boldsymbol{z}^* &\sim \mathcal{N}(\mu_{2|1}, \Sigma_{2_1})
 \end{split}
 \]
 where $\Sigma_{2|1} = \Sigma_{22} - (\Sigma_{11}^{-1}\Sigma_{12})' \Sigma_{12}$ and $\mu_{2|1} = (\Sigma_{11}^{-1}\Sigma_{12})' (y - \mu_{11})$
+
+```{r}
+# n = 100
+# seed = 1
+# sigma = 1
+# phi = 1
+# mu = 0
+# X = matrix(1, nrow = n)
+# beta = 0
+# alpha = 1
+# delta = 1e-9
+# obs_y_prop = .6
+# obs_z_prop = .7
+# colocate = "none"
+
+sim_latentgp_predict <- function(n = 100, seed = 1, sigma = 1, phi = 1, mu = 0, X = matrix(1, nrow = n), beta = 0, alpha = 1, delta = 1e-9, obs_y_prop = .6, obs_z_prop = .5, colocate = "none"){
+  # useful functions
+  distance <- function(x){
+    dist.vec <- parallelDist::parDist(x)
+    dist <- as.matrix(dist.vec)
+    return(dist)
+  }
+
+  # housekeeping
+  if((sqrt(n) %% 1) != 0) stop("n should be a perfect square")
+  set.seed(seed)
+  
+  # create grid
+  sfc <- st_sfc(st_polygon(list(rbind(c(0,0), c(sqrt(n),0), c(sqrt(n),sqrt(n)), c(0,0)))))
+  grid <- st_as_sf(st_make_grid(sfc, cellsize = 1, square = TRUE)) %>% as_tibble
+  names(grid) <- "geometry"
+  rm(sfc)
+  
+  # spatial random effects
+  coords <- grid %>%
+    st_as_sf %>%
+    st_centroid %>%
+    st_coordinates
+
+  dist_mat <- coords %>%
+    as.matrix %>%
+    distance
+  
+  Sigma <- sigma^2 * exp(-dist_mat^2 / (2*phi^2)) + diag(delta, dim(dist_mat))
+  grid$z <- c(mvtnorm::rmvnorm(1, rep(mu, n), Sigma))
+  grid$y <- c(rnorm(n, X %*% beta + grid$z * alpha, 1))
+  
+  # various degrees of masking depending on colocation
+  if(colocate == "none"){
+    grid2 <- grid %>%
+      mutate(obs_y_ind = rbinom(n, 1, obs_y_prop))
+    
+    if((obs_z_prop * n) >= (n - (obs_y_prop * n))){
+      grid2$obs_z_ind <- ifelse(grid2$obs_y_ind == 1, 0, 1)
+    } else{
+      grid2$obs_z_ind  <- rep(0, n)
+      grid2$obs_z_ind[which(grid2$obs_y_ind == 0)] <- rbinom(sum(grid2$obs_y_ind == 0), 1, obs_z_prop)
+    }
+  } else if(colocate == "all"){
+    grid2 <- grid %>%
+      mutate(obs_y_ind = rbinom(n, 1, obs_y_prop))
+    
+    if((obs_z_prop * n) >= (obs_y_prop * n)){
+      grid2$obs_z_ind <- ifelse(grid2$obs_y_ind == 1, 1, 0)
+      grid2$obs_z_ind[which(grid2$obs_y_ind == 0)] <- rbinom(sum(grid2$obs_y_ind == 0), 1, (obs_z_prop - obs_y_prop))
+    } else{
+      grid2$obs_z_ind <- rep(0, n)
+      grid2$obs_z_ind[which(grid2$obs_y_ind == 1)] <-  rbinom(sum(grid2$obs_y_ind == 1), 1, obs_z_prop)
+    }
+    
+  } else{
+    grid2 <- grid %>%
+      mutate(obs_y_ind = rbinom(n, 1, obs_y_prop)) %>%
+      mutate(obs_z_ind = rbinom(n, 1, obs_z_prop))
+  }
+  
+  grid2 <- grid2 %>%
+    mutate(
+      obs_y = ifelse(obs_y_ind == 1, y, NA),
+      obs_z = ifelse(obs_z_ind == 1, z, NA)
+    )
+
+  out <- list(
+    df = grid2,
+    params = list(
+      phi = phi, sigma = sigma, phi = phi, beta = beta, alpha = alpha
+    ),
+    dist_mat = dist_mat,
+    coords = coords
+  )
+  
+  return(out)
+}
+data <- sim_latentgp_predict(n = 10^2, sigma = 1, phi = 3, seed = 06302022, delta = 1e-9, colocate = "some")
+
+p1 <- data$df %>%
+  st_as_sf %>%
+  ggplot() +
+  geom_sf(aes(fill = z)) +
+  theme_bw() +
+  labs(title = "Population spatial effects")
+
+p2 <- data$df %>%
+  st_as_sf %>%
+  filter(obs_z_ind == 1) %>%
+  ggplot() +
+  geom_sf(aes(fill = z)) +
+  theme_bw() +
+  labs(title = "Observed spatial effects")
+
+p3 <- data$df %>%
+  st_as_sf %>%
+  ggplot() +
+  geom_sf(aes(fill = y)) +
+  theme_bw() +
+  labs(title = "Population response")
+
+p4 <- data$df %>%
+  st_as_sf %>%
+  filter(obs_y_ind == 1) %>%
+  ggplot() +
+  geom_sf(aes(fill = y)) +
+  theme_bw() +
+  labs(title = "Observed response")
+
+gridExtra::grid.arrange(p1, p2, p3, p4, nrow = 2, ncol = 2)
+```
+
+### Gibbs sampler
+
+```{r}
+# dat = data$df
+# resp_ind = "obs_y_ind"
+# resp = "obs_y"
+# sp_ind = "obs_z_ind"
+# sp = "obs_z"
+
+data_prep <- function(dat, resp_ind = "obs_y_ind", resp = "obs_y", sp_ind = "obs_z_ind", sp = "obs_z"){
+  # useful functions
+  distance <- function(x){
+    dist.vec <- parallelDist::parDist(x)
+    dist <- as.matrix(dist.vec)
+    return(dist)
+  }
+  
+  # storage
+  out <- list()
+  out$data <- dat
+  dat$ndx <- 1:nrow(dat)
+  
+  # grab response data and spatial data
+  out$resp <- unlist(unname(dat[which(dat[,resp_ind] == 1),resp]))
+  out$resp_row_num <- unlist(unname(dat[which(dat[,resp_ind] == 1),"ndx"]))
+  out$sp <- unlist(unname(dat[which(dat[,sp_ind] == 1),sp]))
+  out$sp_row_num <- unlist(unname(dat[which(dat[,sp_ind] == 1),"ndx"]))
+  
+  out$z_atobsy <- unlist(unname(dat[which(dat[,resp_ind] == 1), sp]))
+  
+  # observed distance matrix
+  out$dist11 <- dat[which(dat[,sp_ind] == 1),] %>%
+    st_as_sf %>%
+    st_centroid %>%
+    st_coordinates %>%
+    as.matrix %>%
+    distance
+  
+  # prediction distance matrix
+  out$dist22 <- dat[which(dat[,sp_ind] == 0 & dat[,resp_ind] == 1),] %>%
+    st_as_sf %>%
+    st_centroid %>%
+    st_coordinates %>%
+    as.matrix %>%
+    distance
+  
+  dist12 <- bind_rows(
+    dat[which(dat[,sp_ind] == 1),],
+    dat[which(dat[,sp_ind] == 0 & dat[,resp_ind] == 1),]
+  ) %>%
+    st_as_sf %>%
+    st_centroid %>%
+    st_coordinates %>%
+    as.matrix %>%
+    distance
+    
+  out$dist12 <- dist12[
+    1:(dim(out$dist11)[1]),
+    (dim(out$dist11)[1] + 1):(dim(dist12)[1])
+  ]
+  
+  return(out)
+  
+}
+
+data_list <- data_prep(
+  data$df
+)
+
+# num_mcmc = 10000
+# warmup = 5000
+# X_ = cbind(
+#   rep(1, length(data_list$resp))
+# )
+# phi_a = 4
+# phi_b = 11.2
+# sigma_a = 1
+# sigma_b = 1
+# initial_prop_var = .05^2
+# adapt = FALSE
+# delta = 1e-6
+# seed = 1
+
+latentgp_mhgibbs_predict <- function(
+    seed, num_mcmc, warmup = num_mcmc/2, 
+    data_list, X_,
+    phi_a = .1, phi_b = .1, sigma_a = .1, sigma_b = .1, delta = .0001, 
+    initial_prop_var = .01, adapt = TRUE, adapt_period = .1*num_mcmc, sd = 2.4^2, epsilon = 1e-6){
+  # hoff text pg 189 for reassurance on posteriors
+  # heikki haario (2001) - An adaptive Metropolis algorithm
+  
+  # seed
+  set.seed(seed)
+  
+  # convenience
+  n <- dim(data_list$dist11)[1]
+  m <- dim(data_list$dist22)[1]
+  p <- ncol(X_)
+  dist11 <- data_list$dist11
+  dist22 <- data_list$dist22
+  dist12 <- data_list$dist12
+  z <- data_list$sp
+  y <- data_list$resp
+  
+  # storage
+  sigma_mcmc <- matrix(NA, num_mcmc, 1)
+  phi_mcmc <- matrix(NA, num_mcmc, 1)
+  accept_ratio <- matrix(0, num_mcmc, 1)
+  mu_mcmc <- matrix(NA, num_mcmc, 1)
+  beta_mcmc <- matrix(NA, num_mcmc, p + 1)
+  pred_mcmc <- matrix(NA, num_mcmc, m)
+  
+  # priors
+  mu0 <- matrix(0, nrow = p + 1, ncol = 1)
+  Sigma0 <- 10 * diag(1, p + 1, p + 1)
+  Sigma0_inv <- solve(Sigma0)
+  prior_prod <- Sigma0_inv %*% mu0
+
+  # initialize
+  # beta <- c(0, 1); beta_mcmc[1,] <- beta
+  # sigma <- 1; sigma_mcmc[1,] <- sigma
+  # sigma2 <- sigma^2
+  # phi <- 3; phi_mcmc[1,] <- phi
+  # phi2 <- phi^2
+  # Omega <- exp(-dist11^2/(2*phi2)) + diag(delta, n, n)
+  # Omega_inv <- solve(Omega)
+  beta <- chol(Sigma0) %*% rnorm(p + 1) + mu0; beta_mcmc[1,] <- beta
+  sigma <- invgamma::rinvgamma(1, sigma_a, sigma_b); sigma_mcmc[1,] <- sigma
+  sigma2 <- sigma^2
+  phi <- invgamma::rinvgamma(1, phi_a, phi_b); phi_mcmc[1,] <- phi
+  phi2 <- phi^2
+  Omega <- exp(-dist11^2/(2*phi2)) + diag(delta, n, n)
+  Omega_inv <- solve(Omega)
+  
+  X_obs <- matrix(1, nrow = length(data_list$sp), ncol = 1)
+  XtOX_obs <- t(X_obs) %*% Omega_inv %*% X_obs
+  XtOz_obs <- t(X_obs) %*% Omega_inv %*% z
+
+  # adaptive
+  Ct <- initial_prop_var
+  
+  # sampler
+  message(paste0("Beginning sampling at "), Sys.time())
+  pb <- txtProgressBar(min = 0, max = num_mcmc, style = 3, width = 50, char = "=")
+  for(iter in 2:num_mcmc){
+    # mu
+    V_obs <- solve(1/sigma2 * XtOX_obs + 1/100) + diag(delta, p, p)
+    m_obs <- V_obs %*% (1/sigma2 * XtOz_obs)
+    mu <- c(chol(V_obs) %*% rnorm(1) + m_obs)
+    
+    # sigma
+    a <- sigma_a + n/2
+    b <- c(sigma_b + .5 * t(z - mu) %*% Omega_inv %*% (z - mu))
+    sigma <- sqrt(invgamma::rinvgamma(1, a, b))
+    sigma2 <- sigma^2
+    
+    # phi - metropolis
+    ## adaptive
+    if(adapt){
+      if(iter <= adapt_period){
+        Ct <- initial_prop_var
+      } else if(iter > adapt_period){
+        Ct <- sd * cov(phi_mcmc[1:(iter-1),,drop = F]) + sd * epsilon
+      }
+    }
+    
+    ## proposal
+    phi_s <- -1
+    while(phi_s <= 0) phi_s <- phi + rnorm(1, 0, sqrt(Ct))
+    phi2_s <- phi_s^2
+    Omega_s <- exp(-dist11^2/(2*phi2_s)) + diag(delta, n, n)
+
+    ## evaluate proposal
+    log_post_current <- mvtnorm::dmvnorm(z, rep(mu,n), sigma2 * Omega, log = T) + invgamma::dinvgamma(phi, phi_a, phi_b, log = T)
+    log_post_s <- mvtnorm::dmvnorm(z, rep(mu,n), sigma2 * Omega_s, log = T) + invgamma::dinvgamma(phi_s, phi_a, phi_b, log = T)
+    log_r <- log_post_s - log_post_current
+    if(log(runif(1)) < log_r){
+      phi <- phi_s
+      phi2 <- phi_s^2
+      Omega <- exp(-dist11^2/(2*phi2)) + diag(delta, n, n)
+      Omega_inv <- solve(Omega)
+      XtOX_obs <- t(X_obs) %*% Omega_inv %*% X_obs
+      XtOz_obs <- t(X_obs) %*% Omega_inv %*% z
+
+      accept_ratio[iter,] <- 1
+    }
+    
+    # predict
+    Sigma11_inv <- (1/sigma^2) * Omega_inv
+    Sigma12 <- sigma^2 * exp(-dist12^2 / (2*phi2))
+    Sigma22 <- sigma^2 * exp(-dist22^2 / (2*phi2))
+    
+    t.Sigma11_inv.Sigma12 <- t(Sigma11_inv %*% Sigma12)
+    Sigma2.1 <- Sigma22 - t.Sigma11_inv.Sigma12 %*% Sigma12
+    Sigma2.1[lower.tri(Sigma2.1)] = t(Sigma2.1)[lower.tri(Sigma2.1)]
+    mu2.1 <- t.Sigma11_inv.Sigma12 %*% (matrix(c(z) - c(mu), ncol = 1))
+    eta <- mvtnorm::rmvnorm(1, mu2.1, Sigma2.1 + diag(delta, dim(Sigma2.1)))
+
+    # betas
+    pred <- data_list$z_atobsy
+    pred[which(is.na(pred))] <- c(eta)
+    model_mat <- cbind(
+      X_, 
+      pred
+    )
+    
+    ## assume variance is known and 1
+    V_beta <- solve(t(model_mat) %*% model_mat + Sigma0_inv)
+    m_beta <- V_beta %*% (t(model_mat) %*% y + prior_prod)
+    beta <- chol(V_beta + diag(delta, dim(V_beta))) %*% rnorm(p+1) + m_beta
+    
+    # storage
+    beta_mcmc[iter,] <- c(beta)
+    sigma_mcmc[iter,] <- sigma
+    phi_mcmc[iter,] <- phi
+    mu_mcmc[iter,] <- mu
+    pred_mcmc[iter,] <- c(eta)
+
+    # progress
+    setTxtProgressBar(pb, iter)
+  }
+  close(pb)
+  message(paste0("Ending sampling at "), Sys.time())
+  
+  samples <- cbind(
+    beta_mcmc[(warmup+1):num_mcmc,],
+    sigma_mcmc[(warmup+1):num_mcmc,],
+    phi_mcmc[(warmup+1):num_mcmc,],
+    mu_mcmc[(warmup+1):num_mcmc,],
+    pred_mcmc[(warmup+1):num_mcmc,]
+  )
+  
+  colnames(samples) <- c(
+    paste0(rep("beta[", p+1), 1:(p+1), rep("]", p+1)), 
+    "sigma", 
+    "phi",
+    "mu",
+    paste0(rep("pred[", m), 1:(m), rep("]", m))
+  )
+  
+  return(
+    list(
+      samples = samples,
+      accept_ratio = accept_ratio
+    )
+  )
+  
+}
+
+# parallel
+this_cluster <- makeCluster(3)
+samples <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = latentgp_mhgibbs_predict,
+  num_mcmc = 10000,
+  warmup = 5000,
+  data_list = data_list,
+  X_ = cbind(
+    rep(1, length(data_list$resp))
+  ),
+  phi_a = 4,
+  phi_b = 11.2,
+  sigma_a = 1,
+  sigma_b = 1,
+  initial_prop_var = .075^2,
+  adapt = TRUE,
+  delta = 1e-06
+)
+stopCluster(this_cluster)
+```
+
+```{r}
+colMeans(samples[[1]]$accept_ratio)
+nimble_summary(list(samples[[1]]$samples, samples[[2]]$samples, samples[[3]]$samples), warmup = 0)
+
+plot(samples[[1]][[1]][,2], type = "l")
+lines(samples[[2]][[1]][,2], type = "l", col = 2)
+lines(samples[[3]][[1]][,2], type = "l", col = 3)
+
+plot(samples[[1]][[1]][,3], type = "l")
+lines(samples[[2]][[1]][,3], type = "l", col = 2)
+lines(samples[[3]][[1]][,3], type = "l", col = 3)
+```
 
 # Count occupancy models
 
