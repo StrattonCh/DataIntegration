@@ -1,0 +1,23 @@
+---
+title: "Data integration "
+description: |
+  A review of hierarchical occupancy modeling
+author:
+  - name: Christian Stratton
+    affiliation: Montana State University
+    affiliation_url: https://math.montana.edu/
+  - name: Kathryn Irvine
+    affiliation: U.S. Geological Survey
+    affiliation_url: https://www.usgs.gov/centers/norock
+  - name: Katharine Banner
+    affiliation: Montana State University
+    affiliation_url: https://math.montana.edu/
+date: "`r Sys.Date()`"
+output: 
+  distill::distill_article:
+    self_contained: false
+    toc: true
+    toc_depth: 2
+bibliography: references.bib
+csl: biometrics_notes.csl
+---
