@@ -575,3 +575,289 @@ ols_sims %>%
   theme_bw()
 ```
 
+# Generalized least squares regression
+
+In this section, we provide a Gibbs sampler a special case of the multivariate normal distribution - ordinary least squares regression. 
+
+## Sampling model and priors
+
+Sampling model:
+\[
+\begin{split}
+y &\sim \mathcal{N}(X\beta, \Sigma) \\
+\Sigma &= \sigma^2\Omega, \Omega\text{ known}
+\end{split}
+\]
+
+Priors:
+\[
+\begin{split}
+\beta &\sim \mathcal{N}(\mu_0, \Sigma_0) \\
+\sigma &\sim IG(a_0, b_0)
+\end{split}
+\]
+
+## Example simulated data
+
+Data generating values: $\beta = c(0,1)$, $\sigma = 1$, $\Omega =$ exp(-as.matrix(dist(1:n)^2/3)).
+
+```{r}
+sim_reg <- function(n, beta, X, sigma, Omega = diag(n), seed = NULL){
+  if(!is.null(seed)) set.seed(seed)
+  
+  mu <- X %*% beta
+  Sigma <- sigma^2 * Omega + diag(.00001, n, n)
+  # y <- chol(Sigma) %*% rnorm(n) + mu
+  y <- c(mvtnorm::rmvnorm(1, mu, Sigma))
+  
+  df <- cbind(
+    y,
+    X[,2:ncol(X), drop=FALSE]
+  ) %>%
+    as_tibble
+  
+  names(df)[2:ncol(df)] <- paste0("x", 1:(ncol(X)-1))
+
+  return(
+    df
+  )
+}
+
+n <- 500
+dat <- sim_reg(
+  n = n, 
+  X = cbind(rep(1, n), rnorm(n)),
+  beta = c(0, 1),
+  sigma = 1, 
+  Omega = exp(-as.matrix(dist(1:n)^2/3)),
+  seed = 05172022
+)
+ggplot() + 
+  geom_point(data = dat, aes(x = x1, y = y)) +
+  theme_bw() +
+  labs(title = bquote("Simulated data:" ~ beta == "c(0, 1)," ~ sigma == "1," ~ Omega == "exp(-as.matrix(dist(1:n)^2/3))"))
+```
+
+## Full conditional posterior distributions
+
+Derivations are omitted, for now. 
+
+\[
+\begin{split}
+\beta | y, \sigma^2 &\sim N(m, V) \\
+V &= \left(\frac{1}{\sigma^2}X' \Omega^{-1}  X + \Sigma_0^{-1}\right)^{-1}\\
+m &= V \left(\frac{1}{\sigma^2}X'\Omega^{-1}y + \Sigma_0^{-1}\mu_0\right)
+\end{split}
+\]
+
+\[
+\begin{split}
+\sigma^2 | y, \mu &\sim \text{Inverse-gamma}(a, b) \\
+a &= a_0 + \frac{n}{2} \\
+b &= b_0 + \frac{1}{2}(y - X\beta)' \Omega^{-1}(y - X\beta)
+\end{split}
+\]
+
+## Gibbs sampler
+
+```{r, echo = T}
+gls_gibbs <- function(seed, num_mcmc, warmup = num_mcmc/2, y, X_, Omega){
+  # hoff text pg 189 for reassurance
+  
+  # seed
+  set.seed(seed)
+  
+  # convenience
+  n <- nrow(X_)
+  p <- ncol(X_)
+  
+  # storage
+  sigma_mcmc <- matrix(NA, num_mcmc, 1)
+  beta_mcmc <- matrix(NA, num_mcmc, p)
+  
+  # priors
+  mu0 <- matrix(0, nrow = p, ncol = 1)
+  Sigma0 <- 1000 * diag(1, p, p)
+  Sigma0_inv <- solve(Sigma0)
+  prior_prod <- Sigma0_inv %*% mu0
+  a0 <- .1
+  b0 <- .1
+  
+  # initialize
+  beta <- chol(Sigma0) %*% rnorm(p) + mu0; beta_mcmc[1,] <- beta
+  # beta <- mvtnorm::rmvnorm(1, mu0, Sigma0); beta_mcmc[1,] <- beta
+  sigma <- invgamma::rinvgamma(1, a0, b0); sigma_mcmc[1,] <- sigma
+  sigma2 <- sigma^2
+  Omega_inv <- solve(Omega + diag(.00001, n, n))
+  
+  # more convenience
+  XtX <- t(X_) %*% X_
+  XtOX <- t(X_) %*% Omega_inv %*% X_
+  Xty <- t(X_) %*% y
+  XtOy <- t(X_) %*% Omega_inv %*% y
+  
+  # sampler
+  pb <- txtProgressBar(min = 0, max = num_mcmc, style = 3, width = 50, char = "=")
+  for(iter in 2:num_mcmc){
+    # beta
+    V <- solve(1/sigma2 * XtOX + Sigma0_inv)
+    m <- V %*% (1/sigma2 * XtOy + prior_prod)
+    
+    beta <- chol(V) %*% rnorm(p) + m
+    # beta <- matrix(c(mvtnorm::rmvnorm(1, m, V)), ncol = 1)
+    Xb <- X_ %*% beta
+    
+    # sigma
+    a <- a0 + n/2
+    # a <- (a0 + n)/2
+    b <- c(b0 + .5 * t(y - Xb) %*% Omega_inv %*% (y - Xb))
+    # b <- (a0*b0 + t(y - Xb) %*% Omega_inv %*% (y - Xb))/2
+    sigma <- sqrt(invgamma::rinvgamma(1, a, b))
+    sigma2 <- sigma^2
+    
+    # storage
+    beta_mcmc[iter,] <- beta
+    sigma_mcmc[iter,] <- sigma
+    
+    # progress
+    setTxtProgressBar(pb, iter)
+  }
+  close(pb)
+  
+  samples <- cbind(
+    beta_mcmc[(warmup+1):num_mcmc,],
+    sigma_mcmc[(warmup+1):num_mcmc,]
+  )
+  
+  colnames(samples) <- c(paste0(rep("beta[", p), 1:p, rep("]", p)), "sigma")
+  
+  return(samples)
+  
+}
+```
+
+### One simulated data set
+
+```{r, echo = T}
+# fit model
+this_cluster <- makeCluster(3)
+samples <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = gls_gibbs,
+  num_mcmc = 5000,
+  warmup = 2500,
+  y = dat$y,
+  X_ = cbind(rep(1, 500), dat$x1),
+  Omega = exp(-as.matrix(dist(1:n)^2/3))
+)
+stopCluster(this_cluster)
+
+# summarize
+model_summary <- nimble_summary(samples)
+model_summary[,c(1, 5, 9:12)]
+```
+
+## Synethetic data simulation
+
+```{r, eval = F}
+library(parallel)
+sim_gls <- function(nsims, n = 400){
+    # convenience function
+  nimble_summary <- function(fit, warmup = nrow(fit[[1]])/2, thin = 1){
+    # convert to coda for normal summary
+    fit_warmup <- lapply(fit, function(x) x[(warmup+1):nrow(x),])
+    coda_samples <- as.mcmc.list(lapply(fit_warmup, function(x) as.mcmc(
+      x, start = warmup+1, end = nrow(fit), thin = thin
+    )))
+    
+    sum <- summary(coda_samples)
+    params <- dimnames(sum$statistics)[[1]]
+    tmp_sum <- cbind(sum$statistics, sum$quantiles)
+    
+    # get r hat / n_eff
+    mat <- matrix(NA, nrow = nrow(tmp_sum), ncol = 3)
+    colnames(mat) <- c("Rhat", "ess_bulk", "ess_tail")
+    for(i in 1:nrow(tmp_sum)){
+      tmp <- sapply(fit, function(x) x[,i])
+      mat[i,] <- c(Rhat(tmp), ess_bulk(tmp), ess_tail(tmp))
+    }
+    
+    # out 
+    out <- cbind(tmp_sum, mat)
+    return(out)
+  }
+  
+  sum_tbl <- list()
+  pb <- txtProgressBar(min = 0, max = nsims, style = 3, width = 50, char = "=")
+  for(sim in 1:nsims){
+    # simulate data
+    dat <- sim_reg(
+      n = n, 
+      X = cbind(rep(1, n), rnorm(n)),
+      beta = c(0, 1),
+      sigma = 1.5, 
+      Omega = exp(-as.matrix(dist(1:n)^2/3)),
+      seed = sim
+    )
+    
+    # fit model - parallel
+    tmp_sim <- sim
+    this_cluster <- makeCluster(3)
+    samples <- parLapply(
+      cl = this_cluster,
+      X = 1:3,
+      fun = gls_gibbs,
+      num_mcmc = 5000,
+      warmup = 2500,
+      y = dat$y,
+      X_ = cbind(rep(1, length(dat$y)), dat$x1),
+      Omega = exp(-as.matrix(dist(1:length(dat$y))^2/3))
+    )
+    stopCluster(this_cluster)
+
+    sum <- nimble_summary(samples, warmup = 0)
+    sum_tbl[[sim]] <- tibble(
+      param = rownames(sum),
+      truth = c(0, 1, 1.5),
+      mean = sum[,1],
+      lwr = sum[,5],
+      upr = sum[,9],
+      rhat = sum[,10],
+      ess_bulk = sum[,11],
+      ess_tail = sum[,12]
+    ) %>%
+      mutate(sim = tmp_sim)
+    
+    setTxtProgressBar(pb, sim)
+  }
+  close(pb)
+  
+  return(do.call("bind_rows", sum_tbl))
+}
+gls_sims <- sim_gls(100, 400)
+saveRDS(gls_sims, "rds files/gls/gls_sims.rds")
+```
+
+```{r}
+gls_sims <- readRDS("rds files/gls/gls_sims.rds")
+gls_sims %>%
+  mutate(
+    capture = factor(case_when(
+      truth >= lwr & truth <= upr ~ 1, 
+      TRUE ~ 0
+    ))
+  ) %>%
+  ggplot() + 
+  geom_linerange(
+    aes(xmin = lwr, xmax = upr, x = mean, col = capture, y = sim)
+  ) +
+  geom_vline(
+    data = tibble(param = c("beta[1]", "beta[2]", "sigma"), int = c(0, 1, 1.5)),
+    aes(xintercept = int),
+    linetype = "dotdash"
+  ) +
+  facet_wrap(~ param, scales = "free_x") +
+  theme_bw()
+```
+
