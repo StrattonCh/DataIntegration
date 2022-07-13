@@ -1224,6 +1224,7 @@ saveRDS(gp_sims, "rds files/gp/gp_sims_1_3.rds")
 ```
 
 ```{r}
+# load sims
 gp_sims <- readRDS("rds files/gp/gp_sims_1_3.rds")
 gp_sims %>%
   mutate(
@@ -1722,7 +1723,7 @@ gp_predict_sims %>%
   geom_vline(
     data = tibble(param = c("mu", "phi", "sigma"), int = c(0, 3, 1)),
     aes(xintercept = int),
-    linetype = "dotdash"
+    linetype = "dashed"
   ) +
   facet_wrap(~ param, scales = "free_x") +
   theme_bw()
@@ -1740,11 +1741,6 @@ gp_predict_sims %>%
   geom_linerange(
     aes(xmin = lwr, xmax = upr, x = mean, col = capture, y = sim)
   ) +
-  # geom_vline(
-  #   data = tibble(param = c("beta[1]", "phi", "sigma"), int = c(0, 3, 1)),
-  #   aes(xintercept = int),
-  #   linetype = "dotdash"
-  # ) +
   facet_wrap(~ param, scales = "free_x", nrow = 8, ncol = 7) +
   theme_bw()
 ```
