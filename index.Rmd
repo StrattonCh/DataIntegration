@@ -20,4 +20,198 @@ output:
     toc_depth: 2
 ---
 
+<style type="text/css">
+.main-container {
+  max-width: 100% !important;
+  margin: auto;
+}
+</style>
+
+```{r setup, include = F}
+rm(list = ls())
+
+library(knitr)
+hook_chunk <- knitr::knit_hooks$get('chunk')
+knit_hooks$set(chunk = function(x, options) {
+
+  # add latex commands if chunk option singlespacing is TRUE
+  if(isTRUE(options$singlespacing)){
+    return(sprintf("\\singlespacing\n %s \n\\doublespacing", hook_chunk(x, options)))
+  } else{
+    return(hook_chunk(x, options))
+  }
+})
+knitr::opts_chunk$set(
+  fig.align = "center",
+  tidy = T,
+  singlespacing = TRUE,
+  cache = FALSE,
+  fig.dim = c(10,8),
+  message = FALSE,
+  warning = FALSE,
+  comment = NA,
+  echo = F
+)
+
+
+# packages
+packs <- c("dplyr", "nimble", "htmltools", "ggplot2", "sf", "Rcpp", "RcppArmadillo", "inline", "mvtnorm", "readr", "parallel", "xtable", "rstan", "coda", "vegan", "tidyr", "gganimate", "stringr", "scatterplot3d", "plot3D", "plotly", "tidyverse", "ggalluvial", "lubridate", "ggnewscale")
+sapply(packs, require, character.only = T)
+rm(packs)
+options(tidyverse.quiet = TRUE)
+
+# convenience
+`%notin%` <- Negate("%in%")
+
+# stan settings
+options(mc.cores = parallel::detectCores() - 1)
+rstan_options(auto_write = TRUE)
+
+# helper functions
+source("helpers.R")
+```
+
 # Introduction
+
+The purpose of this document is to develop a framework that simultaneously models a spatial disease process with acoustic count occupancy data. Additionally, we develop a Gibbs sampler for that model. In the sections that follow, we build toward this framework and provide code for Gibbs sampling intermediate models. 
+
+# Univariate normal 
+
+In this section, we provide a Gibbs sampler for a univariate normal sampling model. 
+
+## Sampling model and priors
+
+Sampling model:
+\[
+y_i \sim N(\mu, \sigma^2)
+\]
+
+Priors:
+\[
+\begin{split}
+\mu &\sim N(\mu_0, \tau_0^2) \\
+\sigma &\sim IG(a_0, b_0)
+\end{split}
+\]
+
+## Example simulated data
+
+Data generating values: $\mu = 0$, $\sigma = 2$.
+
+```{r}
+sim_norm <- function(n, mu, sigma, seed = NULL){
+  if(!is.null(seed)) set.seed(seed)
+  y <- rnorm(n, mu, sigma)
+  return(y)
+}
+y <- sim_norm(500, 0, 2, seed = 05172022)
+ggplot() + 
+  geom_histogram(data = tibble(y = y), aes(x = y)) +
+  theme_bw() +
+  labs(title = bquote("Simulated data:" ~ mu == "0," ~ sigma == 2))
+```
+
+## Full conditional posterior distributions
+
+Derivations are omitted, for now. 
+
+\[
+\begin{split}
+\mu | y, \sigma^2 &\sim N(m, V) \\
+V &= \left(\frac{1}{\tau_0^2} + \frac{n}{\sigma^2}\right)^{-1}\\
+m &= V \left(\frac{\mu_0}{\tau_0^2} +  \frac{1}{\sigma^2}\sum_{i=1}^n y_i\right)
+\end{split}
+\]
+
+\[
+\begin{split}
+\sigma^2 | y, \mu &\sim \text{Inverse-gamma}(a, b) \\
+a &= a_0 + \frac{n}{2} \\
+b &= b_0 + \frac{1}{2}\sum_{i=1}^n (y_i - \mu)^2
+\end{split}
+\]
+
+## Gibbs sampler
+
+```{r, echo = T}
+normal_gibbs <- function(num_mcmc, warmup = num_mcmc/2, y, seed = NULL){
+  
+  if(!is.null(seed)) set.seed(seed)
+  
+  # convenience
+  n <- length(y)
+  sum_y <- sum(y)
+  
+  # storage
+  mu_mcmc <- matrix(NA, num_mcmc, 1)
+  sigma_mcmc <- matrix(NA, num_mcmc, 1)
+  
+  # priors
+  mu0 <- 0
+  tau0 <- 100
+  a0 <- .01
+  b0 <- .01
+  
+  # initialize
+  mu <- rnorm(1, mu0, tau0); mu_mcmc[1,] <- mu
+  sigma <- invgamma::rinvgamma(1, a0, b0); sigma_mcmc[1,] <- sigma
+  
+  # sampler
+  pb <- txtProgressBar(min = 0, max = num_mcmc, style = 3, width = 50, char = "=") 
+  for(iter in 2:num_mcmc){
+    # mu
+    v <- solve(1/tau0^2 + n/sigma^2)
+    m <- v * (mu0 / tau0^2 + sum_y / sigma^2)
+    mu <- rnorm(1, m, sqrt(v))
+    
+    # sigma
+    a <- a0 + n/2
+    b <- b0 + sum((y-mu)^2)/2
+    sigma <- sqrt(invgamma::rinvgamma(1, a, b))
+    
+    # storage
+    mu_mcmc[iter,] <- mu
+    sigma_mcmc[iter,] <- sigma
+    
+    # progress
+    setTxtProgressBar(pb, iter)
+  }
+  close(pb)
+  
+  samples <- cbind(
+    mu = mu_mcmc[(warmup+1):num_mcmc,],
+    sigma = sigma_mcmc[(warmup+1):num_mcmc,]
+  )
+  
+  return(samples)
+  
+}
+```
+
+### One simulated data set
+
+```{r, echo = T}
+# fit model
+this_cluster <- makeCluster(3)
+samples <- parLapply(
+  cl = this_cluster,
+  X = 1:3,
+  fun = normal_gibbs,
+  num_mcmc = 5000,
+  warmup = 2500,
+  y = y
+)
+stopCluster(this_cluster)
+
+# summarize
+nimble_summary(samples)
+```
+
+
+## Synethetic data simulation
+
+
+
+
+
+
