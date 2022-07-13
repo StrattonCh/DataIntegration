@@ -1247,6 +1247,11 @@ gp_sims %>%
 
 # Gaussian process with prediction
 
+```{r}
+rm(list = ls()[-which(ls() == "hook_chunk")])
+source("helpers.R")
+```
+
 In this section, we extend the previous model to make predictions at unsampled locations by leveraging the properties of multivariate normal distributions. 
 
 ## Sampling model and priors
@@ -1292,9 +1297,7 @@ where $\mu_{2|1} = \mu_2 + \Sigma_{21}\Sigma_{11}^{-1}(y_1 - \mu_1) = (\Sigma_{1
 Data generating values: $\beta = 0$, $\sigma = 1$, $\phi = 3$.
 
 ```{r}
-sim_gp_predict <- function(n = 100, seed = 1, sigma = 1, phi = 1, X = matrix(1, nrow = n), beta = 0, delta = 1e-9, pred_prop = .4){
-  # function to simulated occupancy on a square grid
-  
+sim_gp_predict <- function(n = 100, seed = 1, sigma = 1, phi = 1, mu = 0, delta = 1e-9, obs_z_prop = .5){
   # useful functions
   distance <- function(x){
     dist.vec <- parallelDist::parDist(x)
@@ -1317,31 +1320,26 @@ sim_gp_predict <- function(n = 100, seed = 1, sigma = 1, phi = 1, X = matrix(1, 
     st_as_sf %>%
     st_centroid %>%
     st_coordinates
-  
+
   dist_mat <- coords %>%
     as.matrix %>%
     distance
   
   Sigma <- sigma^2 * exp(-dist_mat^2 / (2*phi^2)) + diag(delta, dim(dist_mat))
-  grid$y <- c(mvtnorm::rmvnorm(1, X %*% beta, Sigma))
-  grid$obs_ind <- factor(rbinom(n, size = 1, prob = 1 - pred_prop))
-  # grid$y <- c(chol(Sigma) %*% rnorm(n) + X %*% beta) 
+  grid$z <- c(mvtnorm::rmvnorm(1, rep(mu, n), Sigma))
   
-  grid <- grid %>%
-    arrange(desc(obs_ind))
-    
-  # reorder spatial random effects
-  dist_mat <- grid %>%
-    st_as_sf %>%
-    st_centroid %>%
-    st_coordinates %>%
-    as.matrix %>%
-    distance
-  
+  grid2 <- grid %>%
+    mutate(obs_z_ind = rbinom(n, 1, obs_z_prop))
+
+ grid2 <- grid2 %>%
+    mutate(
+      obs_z = ifelse(obs_z_ind == 1, z, NA)
+    )
+
   out <- list(
-    df = grid,
+    df = grid2,
     params = list(
-      phi = phi, sigma = sigma, phi = phi, beta = beta
+      phi = phi, sigma = sigma, phi = phi
     ),
     dist_mat = dist_mat,
     coords = coords
@@ -1351,25 +1349,26 @@ sim_gp_predict <- function(n = 100, seed = 1, sigma = 1, phi = 1, X = matrix(1, 
 }
 
 data <- sim_gp_predict(
-  n = 15^2, 
+  n = 10^2, 
   sigma = 1,
   phi = 3, 
   seed = 06302022, 
-  delta = 1e-6
+  delta = 1e-6,
+  obs_z_prop = .6
 )
 
 p1 <- data$df %>%
   st_as_sf %>%
   ggplot() +
-  geom_sf(aes(fill = y)) +
+  geom_sf(aes(fill = z)) +
   theme_bw() +
   labs(title = "Population")
 
 p2 <- data$df %>%
   st_as_sf %>%
-  filter(obs_ind == 1) %>%
+  filter(obs_z_ind == 1) %>%
   ggplot() +
-  geom_sf(aes(fill = y)) +
+  geom_sf(aes(fill = z)) +
   theme_bw() +
   labs(title = "Observed data")
 
@@ -1399,11 +1398,66 @@ b &= b_0 + \frac{1}{2}(y - X\beta)' \Omega^{-1}(y - X\beta)
 ## Gibbs sampler
 
 ```{r, echo = T}
+data_prep <- function(dat, sp_ind = "obs_z_ind", sp = "obs_z"){
+  # useful functions
+  distance <- function(x){
+    dist.vec <- parallelDist::parDist(x)
+    dist <- as.matrix(dist.vec)
+    return(dist)
+  }
+  
+  # storage
+  out <- list()
+  out$data <- dat
+  dat$ndx <- 1:nrow(dat)
+  
+  # grab response data and spatial data
+  out$sp <- unlist(unname(dat[which(dat[,sp_ind] == 1),sp]))
+  out$sp_row_num <- unlist(unname(dat[which(dat[,sp_ind] == 1),"ndx"]))
+
+  # observed distance matrix
+  out$dist11 <- dat[which(dat[,sp_ind] == 1),] %>%
+    st_as_sf %>%
+    st_centroid %>%
+    st_coordinates %>%
+    as.matrix %>%
+    distance
+  
+  # prediction distance matrix
+  out$dist22 <- dat[which(dat[,sp_ind] == 0),] %>%
+    st_as_sf %>%
+    st_centroid %>%
+    st_coordinates %>%
+    as.matrix %>%
+    distance
+  
+  dist12 <- bind_rows(
+    dat[which(dat[,sp_ind] == 1),],
+    dat[which(dat[,sp_ind] == 0),]
+  ) %>%
+    st_as_sf %>%
+    st_centroid %>%
+    st_coordinates %>%
+    as.matrix %>%
+    distance
+    
+  out$dist12 <- dist12[
+    1:(dim(out$dist11)[1]),
+    (dim(out$dist11)[1] + 1):(dim(dist12)[1])
+  ]
+  
+  return(out)
+  
+}
+data_list <- data_prep(
+  data$df
+)
+
 gp_mhgibbs_predict <- function(
-    seed, num_mcmc, warmup = num_mcmc/2, y, X_, dist, 
-    phi_a = .1, phi_b = .1, sigma_a = .1, sigma_b = .1,
-    delta = .0001, 
-    initial_prop_var = .01, adapt = TRUE, adapt_period = .1*num_mcmc, sd = 2.4^2, epsilon = 1e-9){
+    seed, num_mcmc, warmup = num_mcmc/2, 
+    data_list,
+    phi_a = .1, phi_b = .1, sigma_a = .1, sigma_b = .1, delta = .0001, 
+    initial_prop_var = .01, adapt = TRUE, adapt_period = .1*num_mcmc, sd = 2.4^2, epsilon = 1e-6){
   # hoff text pg 189 for reassurance on posteriors
   # heikki haario (2001) - An adaptive Metropolis algorithm
   
@@ -1411,42 +1465,38 @@ gp_mhgibbs_predict <- function(
   set.seed(seed)
   
   # convenience
-  N <- dim(dist)[1]
-  n <- nrow(X_)
-  p <- ncol(X_)
-  
-  # sort distances
-  dist11 <- dist[1:n, 1:n]
-  dist12 <- dist[1:n, (n+1):N]
-  dist22 <- dist[(n+1):N, (n+1):N]
+  n <- dim(data_list$dist11)[1]
+  m <- dim(data_list$dist22)[1]
+  dist11 <- data_list$dist11
+  dist22 <- data_list$dist22
+  dist12 <- data_list$dist12
+  z <- data_list$sp
   
   # storage
   sigma_mcmc <- matrix(NA, num_mcmc, 1)
   phi_mcmc <- matrix(NA, num_mcmc, 1)
   accept_ratio <- matrix(0, num_mcmc, 1)
-  beta_mcmc <- matrix(NA, num_mcmc, p)
-  z_mcmc <- matrix(NA, num_mcmc, N - n)
+  mu_mcmc <- matrix(NA, num_mcmc, 1)
+  pred_mcmc <- matrix(NA, num_mcmc, m)
   
   # priors
-  mu0 <- matrix(0, nrow = p, ncol = 1)
-  Sigma0 <- 10 * diag(1, p, p)
-  Sigma0_inv <- solve(Sigma0)
-  prior_prod <- Sigma0_inv %*% mu0
-  a0 <- sigma_a
-  b0 <- sigma_b
-  
+  # mu0 <- matrix(0, nrow = p + 1, ncol = 1)
+  # Sigma0 <- 10 * diag(1, p + 1, p + 1)
+  # Sigma0_inv <- solve(Sigma0)
+  # prior_prod <- Sigma0_inv %*% mu0
+
   # initialize
-  beta <- chol(Sigma0) %*% rnorm(p) + mu0; beta_mcmc[1,] <- beta
-  sigma <- invgamma::rinvgamma(1, a0, b0); sigma_mcmc[1,] <- sigma
+  sigma <- invgamma::rinvgamma(1, sigma_a, sigma_b); sigma_mcmc[1,] <- sigma
   sigma2 <- sigma^2
   phi <- invgamma::rinvgamma(1, phi_a, phi_b); phi_mcmc[1,] <- phi
   phi2 <- phi^2
   Omega <- exp(-dist11^2/(2*phi2)) + diag(delta, n, n)
   Omega_inv <- solve(Omega)
-
-  XtOX <- t(X_) %*% Omega_inv %*% X_
-  XtOy <- t(X_) %*% Omega_inv %*% y
   
+  X_obs <- matrix(1, nrow = length(data_list$sp), ncol = 1)
+  XtOX_obs <- t(X_obs) %*% Omega_inv %*% X_obs
+  XtOz_obs <- t(X_obs) %*% Omega_inv %*% z
+
   # adaptive
   Ct <- initial_prop_var
   
@@ -1454,16 +1504,14 @@ gp_mhgibbs_predict <- function(
   message(paste0("Beginning sampling at "), Sys.time())
   pb <- txtProgressBar(min = 0, max = num_mcmc, style = 3, width = 50, char = "=")
   for(iter in 2:num_mcmc){
-    # beta
-    V <- solve(1/sigma2 * XtOX + Sigma0_inv) + diag(delta, p, p)
-    m <- V %*% (1/sigma2 * XtOy + prior_prod)
-    
-    beta <- chol(V) %*% rnorm(p) + m
-    Xb <- X_ %*% beta
+    # mu
+    V_obs <- solve(1/sigma2 * XtOX_obs + 1/100) + diag(delta, 1, 1)
+    m_obs <- V_obs %*% (1/sigma2 * XtOz_obs)
+    mu <- c(chol(V_obs) %*% rnorm(1) + m_obs)
     
     # sigma
-    a <- a0 + n/2
-    b <- c(b0 + .5 * t(y - Xb) %*% Omega_inv %*% (y - Xb))
+    a <- sigma_a + n/2
+    b <- c(sigma_b + .5 * t(z - mu) %*% Omega_inv %*% (z - mu))
     sigma <- sqrt(invgamma::rinvgamma(1, a, b))
     sigma2 <- sigma^2
     
@@ -1484,41 +1532,36 @@ gp_mhgibbs_predict <- function(
     Omega_s <- exp(-dist11^2/(2*phi2_s)) + diag(delta, n, n)
 
     ## evaluate proposal
-    log_post_current <- mvtnorm::dmvnorm(y, Xb, sigma2 * Omega, log = T) + invgamma::dinvgamma(phi, phi_a, phi_b, log = T)
-    log_post_s <- mvtnorm::dmvnorm(y, Xb, sigma2 * Omega_s, log = T) + invgamma::dinvgamma(phi_s, phi_a, phi_b, log = T)
+    log_post_current <- mvtnorm::dmvnorm(z, rep(mu,n), sigma2 * Omega, log = T) + invgamma::dinvgamma(phi, phi_a, phi_b, log = T)
+    log_post_s <- mvtnorm::dmvnorm(z, rep(mu,n), sigma2 * Omega_s, log = T) + invgamma::dinvgamma(phi_s, phi_a, phi_b, log = T)
     log_r <- log_post_s - log_post_current
     if(log(runif(1)) < log_r){
       phi <- phi_s
       phi2 <- phi_s^2
       Omega <- exp(-dist11^2/(2*phi2)) + diag(delta, n, n)
       Omega_inv <- solve(Omega)
-      XtOX <- t(X_) %*% Omega_inv %*% X_
-      XtOy <- t(X_) %*% Omega_inv %*% y
+      XtOX_obs <- t(X_obs) %*% Omega_inv %*% X_obs
+      XtOz_obs <- t(X_obs) %*% Omega_inv %*% z
 
       accept_ratio[iter,] <- 1
     }
     
     # predict
-    if(iter > warmup){
-      Sigma11_inv <- (1/sigma^2) * Omega_inv
-      Sigma12 <- sigma^2 * exp(-dist12^2 / (2*phi2))
-      Sigma22 <- sigma^2 * exp(-dist22^2 / (2*phi2))
-
-      t.Sigma11_inv.Sigma12 <- t(Sigma11_inv %*% Sigma12)
-      Sigma2.1 <- Sigma22 - t.Sigma11_inv.Sigma12 %*% Sigma12
-      Sigma2.1[lower.tri(Sigma2.1)] = t(Sigma2.1)[lower.tri(Sigma2.1)]
-      mu2.1 <- t.Sigma11_inv.Sigma12 %*% (matrix(c(y), ncol = 1) - Xb)
-
-      z <- mvtnorm::rmvnorm(1, mu2.1, Sigma2.1)
-      z_mcmc[iter,] <- z
-    }
-
-    # z <- chol(Sigma2.1 + diag(delta, dim(Sigma2.1))) %*% rnorm(N-n) + mu2.1
+    Sigma11_inv <- (1/sigma^2) * Omega_inv
+    Sigma12 <- sigma^2 * exp(-dist12^2 / (2*phi2))
+    Sigma22 <- sigma^2 * exp(-dist22^2 / (2*phi2))
+    
+    t.Sigma11_inv.Sigma12 <- t(Sigma11_inv %*% Sigma12)
+    Sigma2.1 <- Sigma22 - t.Sigma11_inv.Sigma12 %*% Sigma12
+    Sigma2.1[lower.tri(Sigma2.1)] = t(Sigma2.1)[lower.tri(Sigma2.1)]
+    mu2.1 <- t.Sigma11_inv.Sigma12 %*% (matrix(c(z) - c(mu), ncol = 1))
+    eta <- mvtnorm::rmvnorm(1, mu2.1, Sigma2.1 + diag(delta, dim(Sigma2.1)))
     
     # storage
-    beta_mcmc[iter,] <- beta
     sigma_mcmc[iter,] <- sigma
     phi_mcmc[iter,] <- phi
+    mu_mcmc[iter,] <- mu
+    pred_mcmc[iter,] <- c(eta)
 
     # progress
     setTxtProgressBar(pb, iter)
@@ -1527,17 +1570,17 @@ gp_mhgibbs_predict <- function(
   message(paste0("Ending sampling at "), Sys.time())
   
   samples <- cbind(
-    beta_mcmc[(warmup+1):num_mcmc,],
     sigma_mcmc[(warmup+1):num_mcmc,],
     phi_mcmc[(warmup+1):num_mcmc,],
-    z_mcmc[(warmup+1):num_mcmc,]
+    mu_mcmc[(warmup+1):num_mcmc,],
+    pred_mcmc[(warmup+1):num_mcmc,]
   )
   
   colnames(samples) <- c(
-    paste0(rep("beta[", p), 1:p, rep("]", p)), 
     "sigma", 
     "phi",
-    paste0(rep("z[", N-n), 1:(N-n), rep("]", N-n))
+    "mu",
+    paste0(rep("pred[", m), 1:(m), rep("]", m))
   )
   
   return(
@@ -1572,11 +1615,7 @@ samples <- parLapply(
   fun = gp_mhgibbs_predict,
   num_mcmc = 10000,
   warmup = 5000,
-  y = data$df %>% filter(obs_ind == 1) %>% select(y) %>% unlist %>% unname, 
-  X_ = cbind(
-    rep(1, sum(data$df$obs_ind == 1))
-  ),
-  dist = data$dist_mat,
+  data_list = data_list,
   phi_a = 4,
   phi_b = 11.2,
   sigma_a = 1,
@@ -1605,6 +1644,7 @@ model_summary[,c(1, 5, 9:12)] %>% round(., 4)
 
 ```{r, eval = F}
 library(parallel)
+rm(data, samples, model_summary, data_list)
 gp_sim_predict <- function(nsims, n = 100){
   sum_tbl <- list()
   pb <- txtProgressBar(min = 0, max = nsims, style = 3, width = 50, char = "=")
@@ -1615,8 +1655,11 @@ gp_sim_predict <- function(nsims, n = 100){
       sigma = 1, 
       phi = 3, 
       seed = sim,
-      delta = 1e-9,
-      pred_prop = .3
+      delta = 1e-6,
+      obs_z_prop = .6
+    )
+    data_list <- data_prep(
+      sim_dat$df
     )
     
     # fit model - parallel
@@ -1626,13 +1669,9 @@ gp_sim_predict <- function(nsims, n = 100){
       cl = this_cluster,
       X = 1:3,
       fun = gp_mhgibbs_predict,
-      num_mcmc = 15000,
-      warmup = 10000,
-      y = sim_dat$df %>% filter(obs_ind == 1) %>% select(y) %>% unlist %>% unname, 
-      X_ = cbind(
-        rep(1, sum(sim_dat$df$obs_ind == 1))
-      ),
-      dist = sim_dat$dist_mat,
+      num_mcmc = 10000,
+      warmup = 5000,
+      data_list = data_list,
       phi_a = 4,
       phi_b = 11.2,
       sigma_a = 1,
@@ -1646,7 +1685,7 @@ gp_sim_predict <- function(nsims, n = 100){
     sum <- nimble_summary(list(samples[[1]]$samples, samples[[2]]$samples, samples[[3]]$samples), warmup = 0)
     sum_tbl[[sim]] <- tibble(
       param = rownames(sum),
-      truth = c(0, 1, 3, sim_dat$df %>% filter(obs_ind == 0) %>% select(y) %>% unlist %>% unname),
+      truth = c(1, 3, 0, data_list$data %>% filter(is.na(obs_z)) %>% select(z) %>% unlist %>% unname),
       mean = sum[,1],
       lwr = sum[,5],
       upr = sum[,9],
@@ -1662,7 +1701,7 @@ gp_sim_predict <- function(nsims, n = 100){
   
   return(do.call("bind_rows", sum_tbl))
 }
-gp_predict_sims <- gp_sim_predict(50, 10^2)
+gp_predict_sims <- gp_sim_predict(100, 10^2)
 saveRDS(gp_predict_sims, "rds files/gp_predict/gp_predict_sims_1_3.rds")
 ```
 
@@ -1675,13 +1714,13 @@ gp_predict_sims %>%
       TRUE ~ 0
     ))
   ) %>%
-  filter(!grepl("z[[]", param)) %>%
+  filter(!grepl("pred[[]", param)) %>%
   ggplot() + 
   geom_linerange(
     aes(xmin = lwr, xmax = upr, x = mean, col = capture, y = sim)
   ) +
   geom_vline(
-    data = tibble(param = c("beta[1]", "phi", "sigma"), int = c(0, 3, 1)),
+    data = tibble(param = c("mu", "phi", "sigma"), int = c(0, 3, 1)),
     aes(xintercept = int),
     linetype = "dotdash"
   ) +
@@ -1696,7 +1735,7 @@ gp_predict_sims %>%
     ))
   ) %>%
   mutate(param = factor(param, levels = gtools::mixedsort(unique(.data$param)))) %>%
-  filter(grepl("z[[]", param)) %>%
+  filter(grepl("pred[[]", param)) %>%
   ggplot() + 
   geom_linerange(
     aes(xmin = lwr, xmax = upr, x = mean, col = capture, y = sim)
@@ -1711,6 +1750,11 @@ gp_predict_sims %>%
 ```
 
 # Latent Gaussian process with prediction
+
+```{r}
+rm(list = ls()[-which(ls() == "hook_chunk")])
+source("helpers.R")
+```
 
 In this section, we imagine that there are two separate but related processes at play; a spatial process and an observation process. The spatial process is partially observed and can be either completely non-colocated with the observation process, partially colocated with the observation process, or completely colocated with the observation process. The observation process depends on the spatial process. 
 
