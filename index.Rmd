@@ -1761,12 +1761,17 @@ __Spatial process__
 Sampling model:
 \[
 \begin{split}
-z &\sim \mathcal{N}(\mu, \Sigma) \\
-\Sigma &= \sigma^2 \Omega = \sigma^2\exp\left(-\frac{d_{ij}^2}{2\phi^2}\right) \\
-z^* &\sim \mathcal{N}(\mu_{2|1}, \Sigma_{2|1})
+z &\sim \mathcal{N}(\mu_1, \Sigma_{11}), \hspace{5mm} \Sigma_{11} = \sigma^2 \Omega = \sigma^2\exp\left(-\frac{d_{ij}^2}{2\phi^2}\right) \\
+z^* | z &\sim \mathcal{N}(\mu_{2|1}, \Sigma_{2|1})
 \end{split}
 \]
-where $d_{ij}$ represents the distance between two sample locations. 
+where $d_{ij}$ represents the distance between two sample locations and $z^*$ represents the predicted spatial random effects at unobserved locations. We assume that
+\[
+\begin{split}
+\begin{bmatrix} z \\ z^* \end{bmatrix} \sim \mathcal{N} \left( \begin{bmatrix} \mu_1 \\ \mu_2 \end{bmatrix}, \begin{bmatrix} \Sigma_{11} & \Sigma_{12} \\ \Sigma_{21} & \Sigma_{22} \end{bmatrix} \right)
+\end{split}
+\]
+and that therefore $\mu_{2|1} = \mu_2 + \Sigma_{21}\Sigma_{11}^{-1}(z - \mu_1) = (\Sigma_{11}^{-1}\Sigma_{12})'(z - \mu_1)$ (assuming a prior mean of 0) and $\Sigma_{2|1} = \Sigma_{22} - (\Sigma_{11}^{-1}\Sigma_{12})'\Sigma_{12}$. 
 
 __Observation process__
 
@@ -2310,3 +2315,57 @@ latentgp_predict_sims %>%
   facet_wrap(~ param, scales = "free_x") +
   theme_bw()
 ```
+
+# Latent Gaussian process with prediction - non-normal spatial process
+
+```{r}
+rm(list = ls()[-which(ls() == "hook_chunk")])
+source("helpers.R")
+```
+
+In this section, we imagine that there are two separate but related processes at play; a spatial process and an observation process. The spatial process is partially observed and can be either completely non-colocated with the observation process, partially colocated with the observation process, or completely colocated with the observation process. The observation process depends on the spatial process. 
+
+## Sampling model and priors
+
+__Spatial process__
+
+Sampling model:
+\[
+\begin{split}
+z_i &\sim \text{Bernoulli}\left(\eta_i \right)\\
+\eta &\sim \mathcal{N}(\mu_1, \Sigma_{11}), \hspace{5mm} \Sigma_{11} = \sigma^2 \Omega = \sigma^2\exp\left(-\frac{d_{ij}^2}{2\phi^2}\right) \\
+\eta^* | \eta &\sim \mathcal{N}(\mu_{2|1}, \Sigma_{2|1})
+\end{split}
+\]
+where $d_{ij}$ represents the distance between two sample locations and $\eta^*$ represents the predicted spatial random effects at unobserved locations. We assume that
+\[
+\begin{split}
+\begin{bmatrix} \eta \\ \eta^* \end{bmatrix} \sim \mathcal{N} \left( \begin{bmatrix} \mu_1 \\ \mu_2 \end{bmatrix}, \begin{bmatrix} \Sigma_{11} & \Sigma_{12} \\ \Sigma_{21} & \Sigma_{22} \end{bmatrix} \right)
+\end{split}
+\]
+and that therefore $\mu_{2|1} = \mu_2 + \Sigma_{21}\Sigma_{11}^{-1}(\eta_ - \mu_1) = (\Sigma_{11}^{-1}\Sigma_{12})'(\eta - \mu_1)$ (assuming a prior mean of 0) and $\Sigma_{2|1} = \Sigma_{22} - (\Sigma_{11}^{-1}\Sigma_{12})'\Sigma_{12}$. 
+
+__Observation process__
+
+Here, we assume the variance is known to be 1 for simplicity. In the future, the observation process will be non-normal (likely negative binomial distributed). 
+
+\[
+\begin{split}
+y_i &\sim N(x'_i \beta + z^*_i\alpha, 1)
+\end{split}
+\]
+
+Priors:
+\[
+\begin{split}
+\mu &\sim \mathcal{N}() \\
+\alpha &\sim \mathcal{N}() \\
+\beta &\sim \mathcal{N}(\mu_0, \Sigma_0) \\
+\sigma &\sim IG(a_0, b_0) \\
+\phi &\sim IG(c_0, d_0)
+\end{split}
+\]
+
+
+
+
