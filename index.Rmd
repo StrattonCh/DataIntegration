@@ -2316,6 +2316,8 @@ latentgp_predict_sims %>%
   theme_bw()
 ```
 
+# Non-normal Gaussian process
+
 # Latent Gaussian process with prediction - non-normal spatial process
 
 ```{r}
