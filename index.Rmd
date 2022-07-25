@@ -2841,3 +2841,104 @@ model_summary <- nimble_summary(
 )
 model_summary[,c(1, 5, 9:12)] %>% round(., 4)
 ```
+
+
+
+
+
+
+# Montana data
+
+```{r, eval = F}
+# from Emily Almberg email 2022/04/15
+pd <- readr::read_csv("data/PdSamplingLocs_AllTime_NABatGRIT_Stratton_4_15_2022.csv")
+saveRDS(pd, "data/pd.rds")
+
+# from Dan Bachen email 2022/02/02
+activity <- readr::read_csv("data/WNSBats_NABatData.csv")
+saveRDS(activity, "data/activity.rds")
+```
+
+```{r}
+activity <- readRDS("data/activity.rds")
+montana <- read_sf("data/Montana")
+```
+
+## Cell 581 Site 4
+
+```{r}
+# grab site and cell
+cell581s4 <- activity %>%
+  filter(grepl("Cell 581 Site 4", Location))
+
+# add time
+cell581s4 <- cell581s4 %>%
+  mutate(
+    date = ymd(stringr::str_sub(Filename, start = 8, end = 15)),
+    time = stringr::str_sub(Filename, start = 17, end = 22)
+  ) %>%
+  mutate(
+    hour = stringr::str_sub(time, start = 1, end = 2),
+    minute = stringr::str_sub(time, start = 3, end = 4),
+    second = stringr::str_sub(time, start = 5, end = 6)
+  ) %>%
+  arrange(
+    date, time
+  )
+
+
+tmp <- cell581s4 %>% select(Filename,Master_Class, date, time:second)
+```
+
+## Pd surveillance data
+
+As of `r Sys.Date()`, none of the Pd surveillance data from Montana caves are included; we are waiting on Dan Bachen to provide "fuzzed" cave locations. 
+
+```{r, eval = F}
+pd <- readRDS("data/pd.rds") %>%
+  arrange(Site_Summary_ID) %>%
+  dplyr::select(
+    site_id = Site_Summary_ID,
+    county = County,
+    wns_summary = `Site_Summary_WNS Case Definition`,
+    lat = Lat_case,
+    lon = Long_case,
+    grts = GRTS_ID,
+    date = FinalDate,
+    specimen_type = Specimen_Type,
+    species = Species,
+  )
+
+pd_sf <- pd %>%
+  # lose caves for now :()
+  filter(!is.na(lon)) %>%
+  filter(wns_summary != "NT") %>%
+  mutate(
+    year = year(mdy(date))
+  ) %>%
+  mutate(
+    wns_resp = factor(case_when(
+      wns_summary %in% c("Neg", "Pd not detected") ~ "No Pd",
+      wns_summary == "Equiv" ~ "equivocal",
+      wns_summary == "Suspect" ~ "suspect",
+      TRUE ~ "Pd"
+    ))
+  ) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4269)
+
+ggplot() +
+  geom_sf(data = montana %>% as_tibble, aes(geometry = geometry)) +
+  geom_sf(
+    data = pd_sf %>% filter(year %in% c(2020:2021)) %>% as_tibble, 
+    aes(geometry = geometry),
+    aes(col = wns_resp), size = 2
+  ) +
+  theme_bw() +
+  labs(
+    title = "Pd surveillance"
+  ) +
+  facet_wrap(~ year, nrow = 1)
+ggsave("pd_surv.png", width = 20, height = 15, units = "in")
+```
+
+
