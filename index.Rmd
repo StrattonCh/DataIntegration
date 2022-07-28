@@ -2883,11 +2883,11 @@ cell581s4 <- cell581s4 %>%
     second = stringr::str_sub(time, start = 5, end = 6)
   ) %>%
   arrange(
-    date, time
+    Filename
   )
 
 
-tmp <- cell581s4 %>% select(Filename,Master_Class, date, time:second)
+tmp <- cell581s4 %>% filter(year(date) == 2021) %>% select(Filename,Master_Class, date, time:second)
 ```
 
 ## Pd surveillance data
